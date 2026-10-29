@@ -8,6 +8,8 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -31,6 +33,28 @@ type statement struct {
 	// Params lists, in positional order, the parameter name each
 	// placeholder is bound to.
 	Params []string
+	// Headers maps parameter names to the request headers that supply
+	// them, as declared by "-- @header :name = Header-Name" comments.
+	Headers map[string]string
+}
+
+var (
+	headerDirectiveStart = regexp.MustCompile(`^@header(\s|$)`)
+	headerDirective      = regexp.MustCompile("^@header\\s+:([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([!#$%&'*+.^_`|~0-9A-Za-z-]+)$")
+)
+
+// parseHeaderDirective recognises "@header :name = Header-Name" in the text
+// of a -- comment. Comments not starting with @header are ignored.
+func parseHeaderDirective(comment string) (name, header string, ok bool, err error) {
+	text := strings.TrimSpace(comment)
+	if !headerDirectiveStart.MatchString(text) {
+		return "", "", false, nil
+	}
+	m := headerDirective.FindStringSubmatch(text)
+	if m == nil {
+		return "", "", false, fmt.Errorf("malformed directive %q: expected -- @header :name = Header-Name", text)
+	}
+	return m[1], m[2], true, nil
 }
 
 // compile scans query for :name placeholders, skipping string literals,
@@ -38,9 +62,10 @@ type statement struct {
 // rewrites them for the given placeholder style.
 func compile(query string, style placeholderStyle) (*statement, error) {
 	var (
-		out    strings.Builder
-		params []string
-		index  = map[string]int{}
+		out     strings.Builder
+		params  []string
+		index   = map[string]int{}
+		headers map[string]string
 	)
 	out.Grow(len(query))
 
@@ -70,6 +95,19 @@ func compile(query string, style placeholderStyle) (*statement, error) {
 				end = n
 			} else {
 				end += i
+			}
+			name, header, ok, err := parseHeaderDirective(query[i+2 : end])
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				if prev, dup := headers[name]; dup {
+					return nil, fmt.Errorf(":%s is mapped to both %s and %s", name, prev, header)
+				}
+				if headers == nil {
+					headers = map[string]string{}
+				}
+				headers[name] = header
 			}
 			out.WriteString(query[i:end])
 			i = end
@@ -116,7 +154,25 @@ func compile(query string, style placeholderStyle) (*statement, error) {
 			i++
 		}
 	}
-	return &statement{SQL: out.String(), Params: params}, nil
+	for name, header := range headers {
+		if !slices.Contains(params, name) {
+			return nil, fmt.Errorf("@header maps %s to :%s, but the query does not use :%s", header, name, name)
+		}
+	}
+	return &statement{SQL: out.String(), Params: params, Headers: headers}, nil
+}
+
+// headerParams sets the parameters declared by @header directives from the
+// request headers, overriding any request parameters of the same name.
+func (s *statement) headerParams(params map[string]any, header http.Header) error {
+	for name, h := range s.Headers {
+		vs := header.Values(h)
+		if len(vs) == 0 {
+			return fmt.Errorf("missing header %s (for :%s)", h, name)
+		}
+		params[name] = strings.Join(vs, ", ")
+	}
+	return nil
 }
 
 // bind resolves the statement's parameters against the supplied values.

@@ -252,7 +252,7 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		return writeError(w, http.StatusBadRequest, err.Error())
 	}
 
-	stmt, args, err := h.prepare(name, query, params)
+	stmt, args, err := h.prepare(name, query, params, r.Header)
 	var badReq *badRequestError
 	if errors.As(err, &badReq) {
 		return writeError(w, http.StatusBadRequest, badReq.Error())
@@ -288,8 +288,9 @@ func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, 
 }
 
 // prepare turns a query file and request parameters into SQL with driver
-// placeholders plus its arguments, rendering templates first.
-func (h *SQLExecutor) prepare(name, query string, params map[string]any) (*statement, []any, error) {
+// placeholders plus its arguments, rendering templates (which may also
+// read request headers) first.
+func (h *SQLExecutor) prepare(name, query string, params map[string]any, header http.Header) (*statement, []any, error) {
 	var bound map[string]any
 	if strings.HasSuffix(name, templateExt) {
 		tpl, err := h.templates.get(name, query)
@@ -297,7 +298,7 @@ func (h *SQLExecutor) prepare(name, query string, params map[string]any) (*state
 			return nil, nil, fmt.Errorf("parsing template: %w", err)
 		}
 		var inputErr *inputError
-		query, bound, err = tpl.render(params)
+		query, bound, err = tpl.render(params, header)
 		if errors.As(err, &inputErr) {
 			return nil, nil, &badRequestError{inputErr}
 		}
@@ -313,6 +314,9 @@ func (h *SQLExecutor) prepare(name, query string, params map[string]any) (*state
 	}
 	if err := checkBoundPlaceholders(stmt, bound); err != nil {
 		return nil, nil, err
+	}
+	if err := stmt.headerParams(params, header); err != nil {
+		return nil, nil, &badRequestError{err}
 	}
 	args, err := stmt.bind(params)
 	if err != nil {

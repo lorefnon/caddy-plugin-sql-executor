@@ -236,6 +236,55 @@ Notes:
 - **Request parameters can't fill the placeholders templates generate.** These are named `__hbs_1`, `__hbs_2` and so on, and request parameters with that prefix are dropped.
 - **Parsed templates are cached and re-parsed when the file changes.**
 
+## Request headers
+
+Queries can read request headers in two ways. Header values are always bound as parameters, like any other value.
+
+### `@header` directives (`.sql` and `.sql.hbs`)
+
+A `--` comment of the form `@header :name = Header-Name` fills the `:name` placeholder from that header:
+
+```sql
+-- @header :user_id = X-User-Id
+SELECT id, total FROM orders WHERE user_id = :user_id
+```
+
+- **The header always wins.** A `user_id` in the body or query string is ignored, so a client can't override the value.
+- **The header is required.** If it's missing, the response is `400` with `missing header X-User-Id (for :user_id)`. A value in the body does not take its place.
+- **Repeated headers are joined** with `", "`.
+- **Mistakes are reported as errors.** A malformed directive, two mappings for the same placeholder, or a mapping whose placeholder the query never uses all return `500`.
+- **Comments that merely start with `@header` are left alone.** Directives are only read from `--` comments, never from string literals or `/* */` comments. So `-- @headers are set by nginx` is just a comment.
+
+### `@headers` in templates
+
+In a `.sql.hbs` template, headers are available as the `@headers` data variable. Header names are case-insensitive:
+
+```handlebars
+SELECT id, name FROM projects
+WHERE tenant_id = {{@headers.x-tenant-id}}
+{{#if @headers.x-include-archived}}{{else}}  AND NOT archived{{/if}}
+```
+
+A missing header is falsy in `{{#if}}` and binds `NULL`. The request body and query string can't supply `@headers` values: a body field named `headers` is ordinary data. Use `@headers.<name>` directly; forms like `@../headers.x` or `@headers.x.y` are rejected.
+
+### Trusting headers
+
+Clients can send any header they like. This plugin passes header values through as-is; whether a value can be trusted is decided by the Caddy config in front of it. If a header carries identity, make sure Caddy sets it and the client can't:
+
+```caddyfile
+handle_path /api/* {
+	# copy_headers replaces any client-supplied X-User-Id
+	# with the auth service's value, or removes it.
+	forward_auth auth-service:9000 {
+		uri /verify
+		copy_headers X-User-Id
+	}
+	sql_executor { ... }
+}
+```
+
+To remove a header the client must not provide, use `request_header -X-User-Id`.
+
 ## Output formats
 
 | | JSON | CSV | YAML | XLSX |

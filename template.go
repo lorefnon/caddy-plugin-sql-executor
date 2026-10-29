@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,10 +40,12 @@ func (e *inputError) Error() string { return e.msg }
 // rejected when the template is parsed.
 type sqlTemplate struct {
 	tpl *raymond.Template
+	// headers lists the names referenced as @headers.<name>.
+	headers []string
 }
 
 func parseSQLTemplate(src string) (*sqlTemplate, error) {
-	rewritten, err := rewriteTemplate(src)
+	rewritten, headers, err := rewriteTemplate(src)
 	if err != nil {
 		return nil, err
 	}
@@ -50,26 +53,60 @@ func parseSQLTemplate(src string) (*sqlTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &sqlTemplate{tpl: tpl}, nil
+	return &sqlTemplate{tpl: tpl, headers: headers}, nil
 }
 
+// absentHeader stands in for referenced headers the request lacks. It is
+// non-nil, so raymond does not fall back from @headers.x to the context
+// path headers.x (which request parameters control); it is falsy in
+// {{#if}}, and binds as NULL.
+type absentHeader struct{}
+
+var absent = (*absentHeader)(nil)
+
 // render evaluates the template against params, returning SQL with :name
-// placeholders and the values for the placeholders it generated.
-func (t *sqlTemplate) render(params map[string]any) (string, map[string]any, error) {
+// placeholders and the values for the placeholders it generated. Request
+// headers are exposed as the @headers data variable, keyed by lower-case
+// name, so request parameters can never masquerade as headers.
+func (t *sqlTemplate) render(params map[string]any, header http.Header) (string, map[string]any, error) {
 	bound := map[string]any{}
 	tpl := t.tpl.Clone()
 	tpl.RegisterHelper("bind", func(v any) raymond.SafeString {
+		if v == absent {
+			v = nil
+		}
 		name := boundParamPrefix + strconv.Itoa(len(bound)+1)
 		bound[name] = v
 		return raymond.SafeString(":" + name)
 	})
 	tpl.RegisterHelper("ident", identHelper)
 
-	out, err := tpl.Exec(params)
+	data := raymond.NewDataFrame()
+	data.Set("headers", headerData(header, t.headers))
+	out, err := tpl.ExecWith(params, data)
 	if err != nil {
 		return "", nil, err
 	}
 	return out, bound, nil
+}
+
+// headerData flattens request headers for templates: names are
+// lower-cased and repeated headers are joined with ", " as in HTTP. Every
+// referenced name is also present as written (matched case-insensitively),
+// holding absent when the request does not carry it.
+func headerData(header http.Header, referenced []string) map[string]any {
+	out := make(map[string]any, len(header)+len(referenced))
+	for k, vs := range header {
+		out[strings.ToLower(k)] = strings.Join(vs, ", ")
+	}
+	for _, name := range referenced {
+		if vs := header.Values(name); len(vs) > 0 {
+			out[name] = strings.Join(vs, ", ")
+		} else {
+			out[name] = absent
+		}
+	}
+	return out
 }
 
 // identHelper renders a value as a double-quoted SQL identifier, quoting
@@ -104,16 +141,21 @@ func identHelper(v any, options *raymond.Options) raymond.SafeString {
 }
 
 // rewriteTemplate validates a template and inserts "bind " into each plain
-// {{expression}}, using statement offsets reported by the parser.
-func rewriteTemplate(src string) (string, error) {
+// {{expression}}, using statement offsets reported by the parser. It also
+// returns the header names referenced via @headers.<name>.
+func rewriteTemplate(src string) (string, []string, error) {
 	program, err := parser.Parse(src)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	w := &templateWalker{src: src}
+	w := &templateWalker{src: src, headers: map[string]bool{}}
 	program.Accept(w)
 	if w.err != nil {
-		return "", w.err
+		return "", nil, w.err
+	}
+	headers := make([]string, 0, len(w.headers))
+	for name := range w.headers {
+		headers = append(headers, name)
 	}
 
 	var b strings.Builder
@@ -124,15 +166,16 @@ func rewriteTemplate(src string) (string, error) {
 		last = pos
 	}
 	b.WriteString(src[last:])
-	return b.String(), nil
+	return b.String(), headers, nil
 }
 
 // templateWalker visits every node, recording where "bind " must be
 // inserted and the first disallowed construct.
 type templateWalker struct {
-	src   string
-	binds []int
-	err   error
+	src     string
+	binds   []int
+	headers map[string]bool
+	err     error
 }
 
 func (w *templateWalker) fail(line int, format string, args ...any) {
@@ -167,6 +210,7 @@ func (w *templateWalker) VisitMustache(n *ast.MustacheStatement) any {
 			pos++
 		}
 		w.binds = append(w.binds, pos)
+		expr.Accept(w)
 		return nil
 	}
 	if name := helperName(expr); !sqlHelpers[name] {
@@ -198,6 +242,7 @@ func (w *templateWalker) VisitContent(*ast.ContentStatement) any { return nil }
 func (w *templateWalker) VisitComment(*ast.CommentStatement) any { return nil }
 
 func (w *templateWalker) VisitExpression(n *ast.Expression) any {
+	n.Path.Accept(w)
 	for _, p := range n.Params {
 		p.Accept(w)
 	}
@@ -211,7 +256,23 @@ func (w *templateWalker) VisitSubExpression(n *ast.SubExpression) any {
 	return n.Expression.Accept(w)
 }
 
-func (w *templateWalker) VisitPath(*ast.PathExpression) any    { return nil }
+// VisitPath records @headers.<name> references. Other shapes are rejected
+// because raymond would resolve them against request parameters whenever
+// the data lookup comes back empty.
+func (w *templateWalker) VisitPath(n *ast.PathExpression) any {
+	if !n.Data || len(n.Parts) == 0 || n.Parts[0] != "headers" {
+		return nil
+	}
+	switch {
+	case n.Depth != 0:
+		w.fail(n.Line, "@%s: refer to headers as @headers.<name>, without ../", n.Original)
+	case len(n.Parts) > 2:
+		w.fail(n.Line, "@%s: header values have no fields", n.Original)
+	case len(n.Parts) == 2:
+		w.headers[n.Parts[1]] = true
+	}
+	return nil
+}
 func (w *templateWalker) VisitString(*ast.StringLiteral) any   { return nil }
 func (w *templateWalker) VisitBoolean(*ast.BooleanLiteral) any { return nil }
 func (w *templateWalker) VisitNumber(*ast.NumberLiteral) any   { return nil }

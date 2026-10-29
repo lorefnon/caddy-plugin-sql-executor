@@ -2,6 +2,7 @@ package sqlexecutor
 
 import (
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,7 +24,7 @@ func TestRewriteTemplate(t *testing.T) {
 		{"SELECT :plain, {{x}}", "SELECT :plain, {{bind x}}"},
 	}
 	for _, tt := range tests {
-		got, err := rewriteTemplate(tt.in)
+		got, _, err := rewriteTemplate(tt.in)
 		if err != nil {
 			t.Errorf("rewriteTemplate(%q): %v", tt.in, err)
 			continue
@@ -36,17 +37,19 @@ func TestRewriteTemplate(t *testing.T) {
 
 func TestRewriteTemplateRejects(t *testing.T) {
 	tests := map[string]string{
-		"SELECT {{{a}}}":                      "raw output is not allowed",
-		"SELECT {{& a}}":                      "raw output is not allowed",
-		"SELECT 1\n{{lookup a b}}":            "line 2: {{lookup a b}}: only bind and ident",
-		"SELECT {{log a}}":                    "only bind and ident",
-		"{{#if a}}{{{a}}}{{/if}}":             "raw output is not allowed",
-		"{{#each a}}{{else}}{{{b}}}{{/each}}": "raw output is not allowed",
-		"SELECT {{> part}}":                   "partials are not supported",
-		"SELECT {{#if a}}":                    "", // syntax error
+		"SELECT {{{a}}}":                        "raw output is not allowed",
+		"SELECT {{& a}}":                        "raw output is not allowed",
+		"SELECT 1\n{{lookup a b}}":              "line 2: {{lookup a b}}: only bind and ident",
+		"SELECT {{log a}}":                      "only bind and ident",
+		"{{#if a}}{{{a}}}{{/if}}":               "raw output is not allowed",
+		"{{#each a}}{{else}}{{{b}}}{{/each}}":   "raw output is not allowed",
+		"{{#each a}}{{@../headers.x}}{{/each}}": "without ../",
+		"SELECT {{@headers.x.y}}":               "header values have no fields",
+		"SELECT {{> part}}":                     "partials are not supported",
+		"SELECT {{#if a}}":                      "", // syntax error
 	}
 	for in, wantMsg := range tests {
-		_, err := rewriteTemplate(in)
+		_, _, err := rewriteTemplate(in)
 		if err == nil {
 			t.Errorf("rewriteTemplate(%q): expected error", in)
 			continue
@@ -73,7 +76,7 @@ ORDER BY {{ident sort allow="name, created_at"}} LIMIT {{limit}}`)
 		"active": false,
 		"sort":   "created_at",
 		"limit":  int64(10),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +99,7 @@ ORDER BY "created_at" LIMIT :__hbs_4`
 	}
 
 	// Renders are independent: counters restart and values don't leak.
-	sql, bound, err = tpl.render(map[string]any{"sort": "name", "limit": int64(1)})
+	sql, bound, err = tpl.render(map[string]any{"sort": "name", "limit": int64(1)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +107,7 @@ ORDER BY "created_at" LIMIT :__hbs_4`
 		t.Errorf("second render: %s %v", sql, bound)
 	}
 
-	_, _, err = tpl.render(map[string]any{"sort": "password", "limit": int64(1)})
+	_, _, err = tpl.render(map[string]any{"sort": "password", "limit": int64(1)}, nil)
 	var inputErr *inputError
 	if !errors.As(err, &inputErr) || !strings.Contains(err.Error(), `"password" is not one of name, created_at`) {
 		t.Errorf("disallowed ident: %v", err)
@@ -116,12 +119,62 @@ func TestRenderTemplateMissingValueBindsNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sql, bound, err := tpl.render(map[string]any{"obj": map[string]any{}})
+	sql, bound, err := tpl.render(map[string]any{"obj": map[string]any{}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sql != "SELECT :__hbs_1, :__hbs_2" || bound["__hbs_1"] != nil || bound["__hbs_2"] != nil || len(bound) != 2 {
 		t.Errorf("got %q %v", sql, bound)
+	}
+}
+
+func TestRenderTemplateHeaders(t *testing.T) {
+	tpl, err := parseSQLTemplate(`SELECT {{@headers.x-user-id}}, {{@headers.X-User-Id}}
+{{#each items}}{{@headers.x-tenant}}{{/each}}
+{{#if @headers.x-missing}}never{{/if}}{{@headers.nope}}
+ORDER BY {{ident @headers.x-sort allow="name"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := http.Header{}
+	header.Set("X-User-Id", "42")
+	header.Add("X-Tenant", "a")
+	header.Add("X-Tenant", "b")
+	header.Set("X-Sort", "name")
+	// A body parameter named "headers" must not be mistaken for headers.
+	params := map[string]any{"items": []any{int64(1)}, "headers": map[string]any{"x-user-id": "spoofed"}}
+
+	sql, bound, err := tpl.render(params, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSQL := "SELECT :__hbs_1, :__hbs_2\n:__hbs_3\n:__hbs_4\nORDER BY \"name\""
+	if sql != wantSQL {
+		t.Errorf("sql\n got: %q\nwant: %q", sql, wantSQL)
+	}
+	wantBound := map[string]any{"__hbs_1": "42", "__hbs_2": "42", "__hbs_3": "a, b", "__hbs_4": nil}
+	if !reflect.DeepEqual(bound, wantBound) {
+		t.Errorf("bound %#v\nwant %#v", bound, wantBound)
+	}
+}
+
+func TestRenderTemplateAbsentHeadersCannotBeSpoofed(t *testing.T) {
+	tpl, err := parseSQLTemplate(`{{@headers.x-user-id}}|{{#if @headers.x-user-id}}SET{{/if}}|` +
+		`{{#each items}}{{@headers.x-user-id}}{{#if @headers.x-user-id}}SET{{/if}}{{/each}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoof := map[string]any{"x-user-id": "spoofed"}
+	params := map[string]any{"headers": spoof, "items": []any{map[string]any{"headers": spoof}}}
+	sql, bound, err := tpl.render(params, http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sql != ":__hbs_1||:__hbs_2" {
+		t.Errorf("sql %q", sql)
+	}
+	if want := map[string]any{"__hbs_1": nil, "__hbs_2": nil}; !reflect.DeepEqual(bound, want) {
+		t.Errorf("bound %#v, want %#v", bound, want)
 	}
 }
 
@@ -137,14 +190,14 @@ func TestIdentHelper(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, _, err := tpl.render(map[string]any{"v": in})
+		got, _, err := tpl.render(map[string]any{"v": in}, nil)
 		if err != nil || got != want {
 			t.Errorf("ident(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
 	for _, bad := range []any{nil, "", int64(3), []any{"a"}} {
 		tpl, _ := parseSQLTemplate("{{ident v}}")
-		_, _, err := tpl.render(map[string]any{"v": bad})
+		_, _, err := tpl.render(map[string]any{"v": bad}, nil)
 		var inputErr *inputError
 		if !errors.As(err, &inputErr) {
 			t.Errorf("ident(%#v): expected input error, got %v", bad, err)
@@ -172,6 +225,7 @@ RETURNING id, name, score`,
 	"shadow.sql":     "SELECT 'plain' AS source",
 	"shadow.sql.hbs": "SELECT 'template' AS source",
 	"slots.sql.hbs":  "SELECT {{a}} AS a",
+	"me.sql.hbs":     "SELECT id, name FROM users WHERE id = {{@headers.x-user-id}}",
 }
 
 func newTemplateHandler(t *testing.T, configure func(*SQLExecutor)) *SQLExecutor {
@@ -274,6 +328,23 @@ func TestTemplateHandler(t *testing.T) {
 			if res := serve(t, h, "POST", target, `{"sort":"id"}`, nil); res.nextCalls != 1 {
 				t.Errorf("%s: expected fall-through, got %d %s", target, res.status, res.body)
 			}
+		}
+	})
+
+	t.Run("request headers", func(t *testing.T) {
+		res := serve(t, h, "POST", "/me", "", map[string]string{"X-User-Id": "2"})
+		if res.status != 200 || res.body != `[{"id":2,"name":"Grace, \"Amazing\""}]`+"\n" {
+			t.Errorf("header value: %d %s", res.status, res.body)
+		}
+		// Header values are bound like any other value.
+		res = serve(t, h, "POST", "/me", "", map[string]string{"X-User-Id": "1 OR 1=1"})
+		if res.status != 200 || res.body != "[]\n" {
+			t.Errorf("header injection: %d %s", res.status, res.body)
+		}
+		// Body and query parameters cannot stand in for headers.
+		res = serve(t, h, "POST", "/me?headers.x-user-id=1", `{"headers": {"x-user-id": 1}}`, nil)
+		if res.status != 200 || res.body != "[]\n" {
+			t.Errorf("spoofed via params: %d %s", res.status, res.body)
 		}
 	})
 
