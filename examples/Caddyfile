@@ -1,0 +1,21 @@
+# Run from the repository root:
+#   sqlite3 examples/app.db < examples/seed.sql
+#   go run ./cmd/caddy run --config examples/Caddyfile
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# /api/products -> examples/queries/products.sql
+	handle_path /api/* {
+		sql_executor {
+			root examples/queries
+			driver sqlite
+			dsn "file:examples/app.db?_pragma=busy_timeout(5000)"
+			timeout 10s
+		}
+	}
+
+	respond "not found" 404
+}
