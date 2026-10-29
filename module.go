@@ -41,7 +41,9 @@ var errBodyTooLarge = errors.New("request body too large")
 // default_format.
 //
 // Queries use :name placeholders, bound from the JSON or form-encoded
-// request body and the query string (body wins).
+// request body and the query string (body wins). Files ending in
+// .sql.hbs are Handlebars templates rendered against the same parameters
+// before execution; see template.go for how they are kept injection-safe.
 type SQLExecutor struct {
 	// Directory containing .sql files, or s3://bucket/prefix.
 	Root string `json:"root,omitempty"`
@@ -70,6 +72,7 @@ type SQLExecutor struct {
 	db            *sql.DB
 	style         placeholderStyle
 	source        source
+	templates     *templateCache
 	defaultFormat format
 	logger        *zap.Logger
 	cancel        context.CancelFunc
@@ -86,6 +89,7 @@ func (SQLExecutor) CaddyModule() caddy.ModuleInfo {
 // Provision opens the database and query source.
 func (h *SQLExecutor) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
+	h.templates = &templateCache{entries: map[string]templateCacheEntry{}}
 	repl := caddy.NewReplacer()
 
 	if h.MaxBodySize <= 0 {
@@ -215,7 +219,7 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 	if !ok {
 		return next.ServeHTTP(w, r)
 	}
-	query, err := h.source.Get(r.Context(), name)
+	name, query, err := h.lookup(r.Context(), name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return next.ServeHTTP(w, r)
 	}
@@ -248,14 +252,14 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		return writeError(w, http.StatusBadRequest, err.Error())
 	}
 
-	stmt, err := compile(query, h.style)
+	stmt, args, err := h.prepare(name, query, params)
+	var badReq *badRequestError
+	if errors.As(err, &badReq) {
+		return writeError(w, http.StatusBadRequest, badReq.Error())
+	}
 	if err != nil {
 		h.logger.Error("invalid query file", zap.String("file", name), zap.Error(err))
 		return writeError(w, http.StatusInternalServerError, h.dbErrorMessage(err))
-	}
-	args, err := stmt.bind(params)
-	if err != nil {
-		return writeError(w, http.StatusBadRequest, err.Error())
 	}
 
 	ctx := r.Context()
@@ -266,6 +270,55 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 	}
 
 	return h.execute(ctx, w, name, f, stmt.SQL, args)
+}
+
+// badRequestError marks failures caused by the request rather than the
+// query file.
+type badRequestError struct{ error }
+
+// lookup finds the file backing a route: name.sql, or failing that the
+// template name.sql.hbs. It returns the name of the file found.
+func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, error) {
+	query, err := h.source.Get(ctx, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		name += templateExt
+		query, err = h.source.Get(ctx, name)
+	}
+	return name, query, err
+}
+
+// prepare turns a query file and request parameters into SQL with driver
+// placeholders plus its arguments, rendering templates first.
+func (h *SQLExecutor) prepare(name, query string, params map[string]any) (*statement, []any, error) {
+	var bound map[string]any
+	if strings.HasSuffix(name, templateExt) {
+		tpl, err := h.templates.get(name, query)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing template: %w", err)
+		}
+		var inputErr *inputError
+		query, bound, err = tpl.render(params)
+		if errors.As(err, &inputErr) {
+			return nil, nil, &badRequestError{inputErr}
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("rendering template: %w", err)
+		}
+		params = mergeBoundParams(params, bound)
+	}
+
+	stmt, err := compile(query, h.style)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkBoundPlaceholders(stmt, bound); err != nil {
+		return nil, nil, err
+	}
+	args, err := stmt.bind(params)
+	if err != nil {
+		return nil, nil, &badRequestError{err}
+	}
+	return stmt, args, nil
 }
 
 func (h *SQLExecutor) execute(ctx context.Context, w http.ResponseWriter, name string, f format, query string, args []any) error {

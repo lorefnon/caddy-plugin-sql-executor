@@ -2,16 +2,22 @@
 
 A [Caddy](https://caddyserver.com) HTTP handler that turns a folder of `.sql` files into an API.
 
-Point it at a local directory or an S3 bucket. Each `.sql` file becomes a route. A `POST` to that route runs the query against PostgreSQL or SQLite and returns the rows as **JSON**, **CSV**, **YAML** or **XLSX**.
+Point it at a local directory or an S3 bucket. Each `.sql` file becomes a route, and so does each `.sql.hbs` [Handlebars template](#handlebars-templates-sqlhbs). A `POST` to that route runs the query against PostgreSQL or SQLite and returns the rows as **JSON**, **CSV**, **YAML** or **XLSX**.
 
 ```
 queries/
 ├── products.sql            → POST /products
+├── search.sql.hbs         → POST /search   (rendered with Handlebars first)
 └── reports/
     └── monthly_sales.sql   → POST /reports/monthly_sales
                               POST /reports/monthly_sales.csv
                               POST /reports/monthly_sales.xlsx
 ```
+## Why?
+
+If you are building a service whose primary purpose is to run some database queries and forward the results to client (think dashboards, data visualizations, reports etc.) the API layer is mostly boilerplate. This plugin enables you to skip the service layer completely. Bring your SQL scripts, point caddy to them, and you are done. 
+
+Focus on data modeling and writing performant queries - caddy takes care of routing.
 
 ## Building
 
@@ -131,6 +137,7 @@ The request path, after any `handle_path` prefix stripping, maps to a file under
 
 - **Format priority.** The path extension wins. Next comes the `Accept` header, which honours q-values and accepts `application/json`, `text/csv`, `application/yaml`, `application/x-yaml`, `text/yaml` and `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`. Last comes `default_format`. If `Accept` lists only types the plugin can't produce, the response is `406`.
 - **Methods.** Only `POST` runs a query. Other methods on an existing route get `405` with `Allow: POST`.
+- **Templates.** If `name.sql` doesn't exist, `name.sql.hbs` is used. When both exist, `name.sql` wins.
 - **Path safety.** Paths are cleaned before lookup, so `..` can't escape `root`. Hidden files and directories (names starting with `.`) are never served.
 
 ## Writing queries
@@ -171,7 +178,63 @@ curl -X POST 'localhost:8080/api/products/by_id?id=3'
 - Form and query-string values are strings. PostgreSQL converts them to the parameter's type, so `?id=3` works against an `int` column.
 - Every placeholder in the file must be supplied, or the response is `400` with `missing parameter(s): ...`. To make a filter optional, send `null` explicitly and write the SQL to allow for it, as `region` does in the example above. On PostgreSQL, cast optional parameters (`:region::text`) so the server can infer their type.
 
-Statements that write data work too. Add `RETURNING` to get rows back; without it the response is an empty result.
+Statements that write data work too. For a bulk insert, use a template with `{{#each}}` over an array of objects. Add `RETURNING` to get rows back; without it the response is an empty result.
+
+## Handlebars templates (`.sql.hbs`)
+
+Use a template when the shape of the SQL depends on the request, for example optional filters, `IN` lists of any length, bulk inserts or a client-chosen sort column. A template is rendered with [Handlebars](https://handlebarsjs.com) against the request parameters (body and query string). The resulting SQL then runs like any other query.
+
+```handlebars
+{{!-- products/search.sql.hbs --}}
+SELECT id, name, category, price
+FROM products
+WHERE 1 = 1
+{{#if categories}}
+  AND category IN ({{#each categories}}{{this}}{{#unless @last}}, {{/unless}}{{/each}})
+{{/if}}
+{{#if max_price}}
+  AND price <= {{max_price}}
+{{/if}}
+ORDER BY {{ident sort allow="id,name,price"}} {{#if desc}}DESC{{else}}ASC{{/if}}
+```
+
+```sh
+curl -X POST localhost:8080/api/products/search \
+  -d '{"categories": ["coffee", "equipment"], "max_price": 30, "sort": "price", "desc": true}'
+```
+
+**`{{value}}` never puts the value into the SQL text.** Each `{{value}}` becomes a bound parameter, the same as a `:name` placeholder. The example above, with two categories, runs as:
+
+```sql
+... AND category IN ($1, $2) AND price <= $3 ORDER BY "price" DESC
+```
+
+The values keep their JSON types: numbers stay numbers and booleans stay booleans. Arrays and objects are bound as JSON text. Input like `"x) OR (1=1"` is only ever compared as data.
+
+What you can use in a template:
+
+| Syntax | Result |
+| --- | --- |
+| `{{name}}`, `{{user.email}}`, `{{this}}`, `{{@index}}` | Bound parameter. A missing value binds `NULL`. |
+| `{{#if}}`, `{{#unless}}`, `{{#each}}`, `{{#with}}`, `{{#equal a "b"}}`, `{{else}}` | Standard Handlebars blocks for structure. |
+| `{{ident col allow="a,b,c"}}` | A double-quoted identifier (`"col"`; `schema.table` becomes `"schema"."table"`). If the value isn't in `allow`, the response is `400`. |
+| `{{bind (lookup obj key)}}` | Explicit binding, for the output of a helper. |
+| `:name` | Still works, and is still **required**: a missing value gets `400`. |
+| `{{!-- comment --}}` | Comment. Use the `--` form if the comment contains `}}`. |
+
+These are rejected when the template is loaded. The request then gets `500`, and the reason is logged (and included in the response with `verbose_errors`):
+
+- `{{{raw}}}` and `{{& raw}}`, which would paste text straight into the SQL.
+- Output from any helper other than `bind` and `ident`, for example `{{lookup a b}}`. Wrap it as `{{bind (lookup a b)}}`.
+- Partials.
+- `{{value}}` inside a quoted SQL string, e.g. `'%{{q}}%'`. The placeholder would just be literal text there. Write `'%' || {{q}} || '%'` instead.
+
+Notes:
+
+- **Identifiers come from the client, so always pass `allow` to `ident`.** Quoting stops injection, but without `allow` a client could still sort by any column, including ones you'd rather not expose.
+- **Guard `IN` lists with `{{#if list}}`.** An empty list would render `IN ()`, which is a syntax error.
+- **Request parameters can't fill the placeholders templates generate.** These are named `__hbs_1`, `__hbs_2` and so on, and request parameters with that prefix are dropped.
+- **Parsed templates are cached and re-parsed when the file changes.**
 
 ## Output formats
 

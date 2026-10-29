@@ -2,6 +2,7 @@ package sqlexecutor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -128,7 +129,11 @@ func (s *statement) bind(values map[string]any) ([]any, error) {
 			missing = append(missing, name)
 			continue
 		}
-		args[i] = v
+		jv, err := jsonIfStructured(v)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q: %w", name, err)
+		}
+		args[i] = jv
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing parameter(s): %s", strings.Join(dedupe(missing), ", "))
@@ -254,16 +259,24 @@ func readParams(r *http.Request, maxBody int64) (map[string]any, error) {
 			params[k] = v[len(v)-1]
 		}
 	case "", "application/json", "text/json":
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(body, &obj); err != nil {
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		dec.UseNumber()
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil || obj == nil {
+			if err == nil {
+				err = errors.New("got null")
+			}
 			return nil, fmt.Errorf("request body must be a JSON object: %w", err)
 		}
-		for k, raw := range obj {
-			v, err := decodeJSONParam(raw)
+		if dec.More() {
+			return nil, errors.New("request body must be a single JSON object")
+		}
+		for k, v := range obj {
+			nv, err := normalizeJSON(v)
 			if err != nil {
 				return nil, fmt.Errorf("parameter %q: %w", k, err)
 			}
-			params[k] = v
+			params[k] = nv
 		}
 	default:
 		return nil, fmt.Errorf("unsupported request content type %q", mediaType)
@@ -271,35 +284,40 @@ func readParams(r *http.Request, maxBody int64) (map[string]any, error) {
 	return params, nil
 }
 
-// decodeJSONParam converts a JSON value into something database drivers
-// accept: numbers become int64 or float64, and arrays/objects are passed
-// as their JSON text (suitable for ::jsonb casts or json_each()).
-func decodeJSONParam(raw json.RawMessage) (any, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return nil, nil
-	}
-	switch trimmed[0] {
-	case '{', '[':
-		return trimmed, nil
-	case 'n':
-		return nil, nil
-	case 't', 'f':
-		var b bool
-		err := json.Unmarshal(raw, &b)
-		return b, err
-	case '"':
-		var s string
-		err := json.Unmarshal(raw, &s)
-		return s, err
-	default:
-		if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+// normalizeJSON converts decoded JSON into values database drivers and
+// templates handle well: numbers become int64 or float64, recursively.
+// Arrays and objects stay structured so templates can iterate them; they
+// are bound to queries as JSON text (see jsonIfStructured).
+func normalizeJSON(v any) (any, error) {
+	switch v := v.(type) {
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
 			return i, nil
 		}
-		f, err := strconv.ParseFloat(trimmed, 64)
+		f, err := strconv.ParseFloat(v.String(), 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid number %s", trimmed)
+			return nil, fmt.Errorf("invalid number %s", v)
 		}
 		return f, nil
+	case []any:
+		for i, e := range v {
+			ne, err := normalizeJSON(e)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = ne
+		}
+		return v, nil
+	case map[string]any:
+		for k, e := range v {
+			ne, err := normalizeJSON(e)
+			if err != nil {
+				return nil, err
+			}
+			v[k] = ne
+		}
+		return v, nil
+	default:
+		return v, nil
 	}
 }

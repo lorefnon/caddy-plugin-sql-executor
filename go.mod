@@ -10,6 +10,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/dustin/go-humanize v1.1.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/mailgun/raymond/v2 v2.0.48
 	github.com/xuri/excelize/v2 v2.11.0
 	go.uber.org/zap v1.28.0
 	gopkg.in/yaml.v3 v3.0.1

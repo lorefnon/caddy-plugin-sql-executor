@@ -155,7 +155,7 @@ func TestReadParams(t *testing.T) {
 		}
 		want := map[string]any{
 			"a": "from-body", "c": "3", "i": int64(42), "f": 1.5, "t": true, "n": nil,
-			"arr": "[1, 2]", "obj": `{"k":"v"}`,
+			"arr": []any{int64(1), int64(2)}, "obj": map[string]any{"k": "v"},
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %#v\nwant %#v", got, want)

@@ -86,6 +86,12 @@ RETURNING id, customer, qty, total, meta`,
 		"dollar.sql":        "SELECT $q$ :not_a_param $q$ AS s, :real::int AS n",
 		"slow.sql":          "SELECT pg_sleep(5)",
 		"broken.sql":        "SELEC 1",
+		"orders/search.sql.hbs": `SELECT id, customer FROM sqlx_orders
+WHERE true
+{{#if ids}} AND id IN ({{#each ids}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}){{/if}}
+{{#if paid}} AND paid = {{paid}}{{/if}}
+{{#if meta}} AND meta @> {{meta}}::jsonb{{/if}}
+ORDER BY {{ident sort allow="id,customer"}} DESC`,
 	}, func(h *SQLExecutor) { h.Timeout = caddy.Duration(300 * time.Millisecond) })
 
 	t.Run("json types", func(t *testing.T) {
@@ -151,6 +157,17 @@ RETURNING id, customer, qty, total, meta`,
 		res := serve(t, h, "POST", "/dollar", `{"real": "7"}`, nil)
 		if res.body != `[{"s":" :not_a_param ","n":7}]`+"\n" {
 			t.Errorf("got %d %s", res.status, res.body)
+		}
+	})
+
+	t.Run("template", func(t *testing.T) {
+		res := serve(t, h, "POST", "/orders/search", `{"ids": [1, 2], "sort": "id"}`, nil)
+		if res.status != 200 || res.body != `[{"id":2,"customer":"globex"},{"id":1,"customer":"acme"}]`+"\n" {
+			t.Errorf("IN list: %d %s", res.status, res.body)
+		}
+		res = serve(t, h, "POST", "/orders/search", `{"paid": true, "meta": {"rush": true}, "sort": "customer"}`, nil)
+		if res.status != 200 || res.body != `[{"id":1,"customer":"acme"}]`+"\n" {
+			t.Errorf("typed bool and jsonb object: %d %s", res.status, res.body)
 		}
 	})
 

@@ -152,6 +152,7 @@ func TestS3Source(t *testing.T) {
 		"queries/.hidden/x.sql":    "SELECT 'hidden'",
 		"other/outside.sql":        "SELECT 'outside prefix'",
 		"queries/nested/three.sql": "SELECT :x AS n",
+		"queries/tpl.sql.hbs":      "SELECT {{x}} AS n",
 	})
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
@@ -184,6 +185,10 @@ func TestS3Source(t *testing.T) {
 	res = serve(t, h, "POST", "/nested/three.csv", `{"x": 3}`, nil)
 	if res.status != 200 || res.body != "n\n3\n" {
 		t.Errorf("/nested/three.csv: %d %q", res.status, res.body)
+	}
+	res = serve(t, h, "POST", "/tpl", `{"x": 4}`, nil)
+	if res.status != 200 || res.body != `[{"n":4}]`+"\n" {
+		t.Errorf("/tpl: %d %s", res.status, res.body)
 	}
 	for _, miss := range []string{"/readme", "/.hidden/x", "/outside", "/../other/outside"} {
 		if res := serve(t, h, "POST", miss, "", nil); res.nextCalls != 1 {
