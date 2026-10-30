@@ -1,148 +1,30 @@
 package sqlexecutor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/mailgun/raymond/v2"
-	"github.com/mailgun/raymond/v2/ast"
-	"github.com/mailgun/raymond/v2/parser"
 )
 
-// templateExt marks query files that are Handlebars templates rendering
-// to SQL, e.g. reports/sales.sql.hbs.
-const templateExt = ".hbs"
-
-// boundParamPrefix names the placeholders generated for {{value}}
+// boundParamPrefix names the placeholders generated for {{ value }}
 // expressions in templates; request parameters with this prefix are
 // discarded.
 const boundParamPrefix = "__tpl_"
 
-// queryTemplate renders a query file to SQL with :name placeholders, plus
-// values for the placeholders it generated.
-type queryTemplate interface {
-	render(params map[string]any, header http.Header) (string, map[string]any, error)
-}
-
 // isTemplate reports whether a query file name is a template.
 func isTemplate(name string) bool {
-	return strings.HasSuffix(name, templateExt) || strings.HasSuffix(name, jinjaExt)
+	return strings.HasSuffix(name, jinjaExt)
 }
-
-func parseQueryTemplate(name, src string) (queryTemplate, error) {
-	if strings.HasSuffix(name, jinjaExt) {
-		return parseJinjaTemplate(src)
-	}
-	return parseSQLTemplate(src)
-}
-
-// sqlHelpers are the helpers whose output may appear directly in SQL.
-var sqlHelpers = map[string]bool{"bind": true, "ident": true}
 
 // inputError reports a template failure caused by request data rather
 // than by the template itself.
 type inputError struct{ msg string }
 
 func (e *inputError) Error() string { return e.msg }
-
-// sqlTemplate is a parsed query template.
-//
-// Templates are made injection-safe by construction: every plain
-// {{expression}} is rewritten to {{bind expression}}, which emits a bound
-// parameter placeholder rather than the value itself. Raw output
-// ({{{x}}} / {{& x}}), partials and helpers other than bind and ident are
-// rejected when the template is parsed.
-type sqlTemplate struct {
-	tpl *raymond.Template
-	// headers lists the names referenced as @headers.<name>.
-	headers []string
-}
-
-func parseSQLTemplate(src string) (*sqlTemplate, error) {
-	rewritten, headers, err := rewriteTemplate(src)
-	if err != nil {
-		return nil, err
-	}
-	tpl, err := raymond.Parse(rewritten)
-	if err != nil {
-		return nil, err
-	}
-	return &sqlTemplate{tpl: tpl, headers: headers}, nil
-}
-
-// absentHeader stands in for referenced headers the request lacks. It is
-// non-nil, so raymond does not fall back from @headers.x to the context
-// path headers.x (which request parameters control); it is falsy in
-// {{#if}}, and binds as NULL.
-type absentHeader struct{}
-
-var absent = (*absentHeader)(nil)
-
-// render evaluates the template against params, returning SQL with :name
-// placeholders and the values for the placeholders it generated. Request
-// headers are exposed as the @headers data variable, keyed by lower-case
-// name, so request parameters can never masquerade as headers.
-func (t *sqlTemplate) render(params map[string]any, header http.Header) (string, map[string]any, error) {
-	bound := map[string]any{}
-	tpl := t.tpl.Clone()
-	tpl.RegisterHelper("bind", func(v any) raymond.SafeString {
-		if v == absent {
-			v = nil
-		}
-		name := boundParamPrefix + strconv.Itoa(len(bound)+1)
-		bound[name] = v
-		return raymond.SafeString(":" + name)
-	})
-	tpl.RegisterHelper("ident", identHelper)
-
-	data := raymond.NewDataFrame()
-	data.Set("headers", headerData(header, t.headers))
-	out, err := tpl.ExecWith(params, data)
-	if err != nil {
-		return "", nil, err
-	}
-	return out, bound, nil
-}
-
-// headerData flattens request headers for templates: names are
-// lower-cased and repeated headers are joined with ", " as in HTTP. Every
-// referenced name is also present as written (matched case-insensitively),
-// holding absent when the request does not carry it.
-func headerData(header http.Header, referenced []string) map[string]any {
-	out := make(map[string]any, len(header)+len(referenced))
-	for k, vs := range header {
-		out[strings.ToLower(k)] = strings.Join(vs, ", ")
-	}
-	for _, name := range referenced {
-		if vs := header.Values(name); len(vs) > 0 {
-			out[name] = strings.Join(vs, ", ")
-		} else {
-			out[name] = absent
-		}
-	}
-	return out
-}
-
-// identHelper is the Handlebars form of quoteIdent: {{ident col allow="a,b"}}.
-func identHelper(v any, options *raymond.Options) raymond.SafeString {
-	var allow []string
-	if a := options.HashStr("allow"); a != "" {
-		for _, s := range strings.Split(a, ",") {
-			allow = append(allow, strings.TrimSpace(s))
-		}
-	}
-	quoted, err := quoteIdent(v, allow)
-	if err != nil {
-		panic(&inputError{err.Error()})
-	}
-	return raymond.SafeString(quoted)
-}
 
 // quoteIdent renders a value as a double-quoted SQL identifier, quoting
 // each dot-separated part. With an allow list the value must be one of the
@@ -164,171 +46,6 @@ func quoteIdent(v any, allow []string) (string, error) {
 		parts[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
 	}
 	return strings.Join(parts, "."), nil
-}
-
-// rewriteTemplate validates a template and inserts "bind " into each plain
-// {{expression}}, using statement offsets reported by the parser. It also
-// returns the header names referenced via @headers.<name>.
-func rewriteTemplate(src string) (string, []string, error) {
-	program, err := parser.Parse(src)
-	if err != nil {
-		return "", nil, err
-	}
-	w := &templateWalker{src: src, headers: map[string]bool{}}
-	program.Accept(w)
-	if w.err != nil {
-		return "", nil, w.err
-	}
-	headers := make([]string, 0, len(w.headers))
-	for name := range w.headers {
-		headers = append(headers, name)
-	}
-
-	var b strings.Builder
-	last := 0
-	for _, pos := range w.binds {
-		b.WriteString(src[last:pos])
-		b.WriteString("bind ")
-		last = pos
-	}
-	b.WriteString(src[last:])
-	return b.String(), headers, nil
-}
-
-// templateWalker visits every node, recording where "bind " must be
-// inserted and the first disallowed construct.
-type templateWalker struct {
-	src     string
-	binds   []int
-	headers map[string]bool
-	err     error
-}
-
-func (w *templateWalker) fail(line int, format string, args ...any) {
-	if w.err == nil {
-		w.err = fmt.Errorf("line %d: "+format, append([]any{line}, args...)...)
-	}
-}
-
-func (w *templateWalker) VisitProgram(n *ast.Program) any {
-	for _, s := range n.Body {
-		s.Accept(w)
-	}
-	return nil
-}
-
-func (w *templateWalker) VisitMustache(n *ast.MustacheStatement) any {
-	expr := n.Expression
-	if n.Unescaped {
-		w.fail(n.Line, "%s: raw output is not allowed in SQL templates; use double braces to bind the value as a parameter",
-			w.snippet(n.Pos))
-		return nil
-	}
-	if len(expr.Params) == 0 && expr.Hash == nil {
-		// Plain value: insert "bind " after "{{" and an optional "~".
-		pos := n.Pos
-		if !strings.HasPrefix(w.src[pos:], "{{") {
-			w.fail(n.Line, "unexpected template structure near offset %d", pos)
-			return nil
-		}
-		pos += 2
-		if strings.HasPrefix(w.src[pos:], "~") {
-			pos++
-		}
-		w.binds = append(w.binds, pos)
-		expr.Accept(w)
-		return nil
-	}
-	if name := helperName(expr); !sqlHelpers[name] {
-		w.fail(n.Line, "%s: only bind and ident may produce output in SQL templates; wrap other helpers as {{bind (helper ...)}}",
-			w.snippet(n.Pos))
-		return nil
-	}
-	expr.Accept(w)
-	return nil
-}
-
-func (w *templateWalker) VisitBlock(n *ast.BlockStatement) any {
-	n.Expression.Accept(w)
-	if n.Program != nil {
-		n.Program.Accept(w)
-	}
-	if n.Inverse != nil {
-		n.Inverse.Accept(w)
-	}
-	return nil
-}
-
-func (w *templateWalker) VisitPartial(n *ast.PartialStatement) any {
-	w.fail(n.Line, "partials are not supported in SQL templates")
-	return nil
-}
-
-func (w *templateWalker) VisitContent(*ast.ContentStatement) any { return nil }
-func (w *templateWalker) VisitComment(*ast.CommentStatement) any { return nil }
-
-func (w *templateWalker) VisitExpression(n *ast.Expression) any {
-	n.Path.Accept(w)
-	for _, p := range n.Params {
-		p.Accept(w)
-	}
-	if n.Hash != nil {
-		n.Hash.Accept(w)
-	}
-	return nil
-}
-
-func (w *templateWalker) VisitSubExpression(n *ast.SubExpression) any {
-	return n.Expression.Accept(w)
-}
-
-// VisitPath records @headers.<name> references. Other shapes are rejected
-// because raymond would resolve them against request parameters whenever
-// the data lookup comes back empty.
-func (w *templateWalker) VisitPath(n *ast.PathExpression) any {
-	if !n.Data || len(n.Parts) == 0 || n.Parts[0] != "headers" {
-		return nil
-	}
-	switch {
-	case n.Depth != 0:
-		w.fail(n.Line, "@%s: refer to headers as @headers.<name>, without ../", n.Original)
-	case len(n.Parts) > 2:
-		w.fail(n.Line, "@%s: header values have no fields", n.Original)
-	case len(n.Parts) == 2:
-		w.headers[n.Parts[1]] = true
-	}
-	return nil
-}
-func (w *templateWalker) VisitString(*ast.StringLiteral) any   { return nil }
-func (w *templateWalker) VisitBoolean(*ast.BooleanLiteral) any { return nil }
-func (w *templateWalker) VisitNumber(*ast.NumberLiteral) any   { return nil }
-func (w *templateWalker) VisitHashPair(n *ast.HashPair) any    { return n.Val.Accept(w) }
-func (w *templateWalker) VisitHash(n *ast.Hash) any {
-	for _, p := range n.Pairs {
-		p.Accept(w)
-	}
-	return nil
-}
-
-func helperName(expr *ast.Expression) string {
-	if p, ok := expr.Path.(*ast.PathExpression); ok {
-		return p.Original
-	}
-	return ""
-}
-
-// snippet returns the source text of the mustache starting at pos.
-func (w *templateWalker) snippet(pos int) string {
-	rest := w.src[pos:]
-	end := strings.Index(rest, "}}")
-	if end < 0 {
-		return rest
-	}
-	end += 2
-	if strings.HasPrefix(rest[end:], "}") {
-		end++
-	}
-	return rest[:end]
 }
 
 // mergeBoundParams adds the template's generated parameters to the
@@ -360,8 +77,8 @@ func jsonIfStructured(v any) (any, error) {
 }
 
 // checkBoundPlaceholders reports generated placeholders that did not
-// survive compilation, which happens when {{value}} is written inside a
-// quoted SQL string ('%{{q}}%') and would silently match the literal text.
+// survive compilation, which happens when {{ value }} is written inside a
+// quoted SQL string ('%{{ q }}%') and would silently match the literal text.
 func checkBoundPlaceholders(stmt *statement, bound map[string]any) error {
 	used := make(map[string]bool, len(stmt.Params))
 	for _, p := range stmt.Params {
@@ -370,32 +87,89 @@ func checkBoundPlaceholders(stmt *statement, bound map[string]any) error {
 	for name := range bound {
 		if !used[name] {
 			return errors.New("a template value appears inside a quoted SQL string or comment, " +
-				"where it cannot be bound; build the string in SQL instead, e.g. '%' || {{q}} || '%'")
+				"where it cannot be bound; build the string in SQL instead, e.g. '%' || {{ q }} || '%'")
 		}
 	}
 	return nil
 }
 
-// templateCache keeps parsed templates keyed by route name, re-parsing
-// whenever the source text changes.
+// templateCache keeps parsed templates keyed by file name, re-parsing
+// whenever the source text changes, or that of a template it extends.
 type templateCache struct {
+	// source serves the templates that Jinja templates load; nil unless
+	// jinja_includes is enabled.
+	source source
+
 	mu      sync.Mutex
 	entries map[string]templateCacheEntry
 }
 
 type templateCacheEntry struct {
-	src string
-	tpl queryTemplate
-	err error
+	src  string
+	deps map[string]string // templates read while parsing, with their source
+	tpl  *jinjaTemplate
+	err  error
 }
 
-func (c *templateCache) get(name, src string) (queryTemplate, error) {
+func newTemplateCache(src source) *templateCache {
+	return &templateCache{source: src, entries: map[string]templateCacheEntry{}}
+}
+
+func (c *templateCache) get(ctx context.Context, name, src string) (*jinjaTemplate, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if e, ok := c.entries[name]; ok && e.src == src {
+	e, ok := c.entries[name]
+	c.mu.Unlock()
+	if ok && e.src == src && c.current(ctx, e.deps) {
 		return e.tpl, e.err
 	}
-	tpl, err := parseQueryTemplate(name, src)
-	c.entries[name] = templateCacheEntry{src: src, tpl: tpl, err: err}
-	return tpl, err
+
+	e = templateCacheEntry{src: src}
+	var loader *templateCache
+	if c.source != nil {
+		loader = c
+	}
+	e.tpl, e.deps, e.err = parseJinjaTemplate(ctx, name, src, loader)
+	// A failure may come from a template that is missing or unreadable for
+	// now, so with loading enabled, failures are not cached.
+	if e.err == nil || c.source == nil {
+		c.mu.Lock()
+		c.entries[name] = e
+		c.mu.Unlock()
+	}
+	return e.tpl, e.err
+}
+
+// current reports whether the templates read while parsing are unchanged.
+func (c *templateCache) current(ctx context.Context, deps map[string]string) bool {
+	for name, want := range deps {
+		if got, err := c.source.Get(ctx, name); err != nil || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+// read returns the source of a template that another one loads.
+func (c *templateCache) read(ctx context.Context, name string) (string, error) {
+	if !strings.HasSuffix(name, jinjaExt) || !validQueryFile(name) {
+		return "", fmt.Errorf("cannot load template %q: names are relative to the query root and end in %s", name, jinjaExt)
+	}
+	src, err := c.source.Get(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("loading template %q: %w", name, err)
+	}
+	return src, nil
+}
+
+// jinja returns the checked Jinja template that another one loads.
+func (c *templateCache) jinja(ctx context.Context, name string) (*jinjaTemplate, error) {
+	src, err := c.read(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	tpl, err := c.get(ctx, name, src)
+	if err != nil {
+		return nil, fmt.Errorf("in %s: %w", name, err)
+	}
+	return tpl, nil
 }

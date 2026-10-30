@@ -1,0 +1,4 @@
+{# Shared by product listings; not a route because the name has no .sql. #}
+SELECT id, name, price FROM products
+WHERE 1 = 1{% block filters %}{% endblock %}
+ORDER BY {% block order %}id{% endblock %}

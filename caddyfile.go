@@ -33,6 +33,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    max_open_conns <n>
 //	    max_idle_conns <n>
 //	    verbose_errors
+//	    jinja_includes
 //	    s3 {
 //	        region            <region>
 //	        endpoint          <url>
@@ -96,6 +97,11 @@ func (h *SQLExecutor) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			h.VerboseErrors = true
+		case "jinja_includes":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			h.JinjaIncludes = true
 		case "s3":
 			if d.NextArg() {
 				return d.ArgErr()

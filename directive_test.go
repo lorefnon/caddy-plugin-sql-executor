@@ -43,8 +43,8 @@ var directiveQueries = map[string]string{
 	"me.sql": `-- The caller's identity comes from the auth proxy, never the body.
 -- @header :uid = X-User-Id
 SELECT id, name FROM users WHERE id = :uid`,
-	"me_named.sql.hbs": `-- @header :uid = X-User-Id
-SELECT id, name FROM users WHERE id = :uid{{#if name}} AND name = {{name}}{{/if}}`,
+	"me_named.sql.j2": `-- @header :uid = X-User-Id
+SELECT id, name FROM users WHERE id = :uid{% if name %} AND name = {{ name }}{% endif %}`,
 	"typo.sql": "-- @header :uid = X-User-Id\nSELECT id FROM users WHERE id = :user_id",
 }
 

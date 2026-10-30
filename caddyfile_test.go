@@ -23,6 +23,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		max_open_conns 20
 		max_idle_conns 5
 		verbose_errors
+		jinja_includes
 		s3 {
 			region eu-west-1
 			endpoint http://localhost:9000
@@ -48,6 +49,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		MaxOpenConns:  20,
 		MaxIdleConns:  5,
 		VerboseErrors: true,
+		JinjaIncludes: true,
 		S3: &S3Config{
 			Region:          "eu-west-1",
 			Endpoint:        "http://localhost:9000",
@@ -74,6 +76,7 @@ func TestUnmarshalCaddyfileErrors(t *testing.T) {
 		"sql_executor {\nmax_body_size lots\n}",
 		"sql_executor {\nmax_open_conns -1\n}",
 		"sql_executor {\nverbose_errors yes\n}",
+		"sql_executor {\njinja_includes on\n}",
 		"sql_executor {\ns3 x {\n}\n}",
 		"sql_executor {\ns3 {\nbogus\n}\n}",
 		"sql_executor {\ns3 {\nuse_path_style no\n}\n}",

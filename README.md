@@ -2,13 +2,14 @@
 
 A [Caddy](https://caddyserver.com) HTTP handler that turns a folder of `.sql` files into an API.
 
-Point it at a local directory or an S3 bucket. Each `.sql` file becomes a route, and so does each [Jinja](#jinja-templates-sqlj2) (`.sql.j2`) or [Handlebars](#handlebars-templates-sqlhbs) (`.sql.hbs`) template. A `POST` to that route runs the query against PostgreSQL or SQLite and returns the rows as **JSON**, **CSV**, **YAML** or **XLSX**.
+Point it at a local directory or an S3 bucket. Each `.sql` file becomes a route, and so does each [Jinja](#jinja-templates-sqlj2) (`.sql.j2`) template. A `POST` to that route runs the query against PostgreSQL or SQLite and returns the rows as **JSON**, **CSV**, **YAML** or **XLSX**.
 
 ```
 queries/
 ├── products.sql            → POST /products
-├── search.sql.j2          → POST /search   (rendered with Jinja first)
-├── report.sql.hbs         → POST /report   (rendered with Handlebars first)
+├── search.sql.j2           → POST /search   (rendered with Jinja first)
+├── partials/
+│   └── filters.j2          → not a route; included by templates
 └── reports/
     └── monthly_sales.sql   → POST /reports/monthly_sales
                               POST /reports/monthly_sales.csv
@@ -63,6 +64,7 @@ example.com {
 			max_open_conns 10
 			max_idle_conns 5
 			# verbose_errors                  # include DB error text in responses
+			# jinja_includes                  # allow include/import/extends/macro in .sql.j2
 		}
 	}
 }
@@ -114,7 +116,7 @@ Query files are fetched **on first use** and kept in an in-memory cache:
 How the cache behaves:
 
 - **Expired entries are revalidated.** After `cache_ttl`, the next request asks S3 whether the file changed (a conditional `GET` using the ETag). An unchanged file isn't downloaded again. Changes and deletions are therefore picked up within `cache_ttl`.
-- **Missing files are cached too.** A route with no file costs up to three `GET`s (`.sql`, `.sql.hbs`, `.sql.j2`) and is then remembered for `cache_ttl`, like any other entry. A file added later appears once the cached miss expires.
+- **Missing files are cached too.** A route with no file costs up to two `GET`s (`.sql`, `.sql.j2`) and is then remembered for `cache_ttl`, like any other entry. A file added later appears once the cached miss expires.
 - **Concurrent requests share one fetch.** Many simultaneous requests for an uncached file result in a single S3 request.
 - **S3 outages degrade gracefully.** If S3 fails while revalidating, the cached copy keeps being served and is checked again after another `cache_ttl`. A request for a file that isn't cached fails with `500`.
 - **Startup doesn't depend on S3.** Nothing is loaded when Caddy starts, so an unreachable bucket is logged as a warning rather than stopping Caddy.
@@ -154,7 +156,7 @@ The request path, after any `handle_path` prefix stripping, maps to a file under
 
 - **Format priority.** The path extension wins. Next comes the `Accept` header, which honours q-values and accepts `application/json`, `text/csv`, `application/yaml`, `application/x-yaml`, `text/yaml` and `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`. Last comes `default_format`. If `Accept` lists only types the plugin can't produce, the response is `406`.
 - **Methods.** Only `POST` runs a query. Other methods on an existing route get `405` with `Allow: POST`.
-- **Templates.** Files are tried in the order `name.sql`, `name.sql.hbs`, `name.sql.j2`, and the first one that exists is used.
+- **Templates.** `name.sql` is tried before `name.sql.j2`, and the first one that exists is used. Only files ending in `.sql` or `.sql.j2` are routes, so templates that other templates load (for example `partials/filters.j2`) are not.
 - **Path safety.** Paths are cleaned before lookup, so `..` can't escape `root`. Hidden files and directories (names starting with `.`) are never served.
 
 ## Writing queries
@@ -195,7 +197,7 @@ curl -X POST 'localhost:8080/api/products/by_id?id=3'
 - Form and query-string values are strings. PostgreSQL converts them to the parameter's type, so `?id=3` works against an `int` column.
 - Every placeholder in the file must be supplied, or the response is `400` with `missing parameter(s): ...`. To make a filter optional, send `null` explicitly and write the SQL to allow for it, as `region` does in the example above. On PostgreSQL, cast optional parameters (`:region::text`) so the server can infer their type.
 
-Statements that write data work too. For a bulk insert, use a template with `{{#each}}` over an array of objects. Add `RETURNING` to get rows back; without it the response is an empty result.
+Statements that write data work too. For a bulk insert, use a template with `{% for %}` over an array of objects. Add `RETURNING` to get rows back; without it the response is an empty result.
 
 ## Jinja templates (`.sql.j2`)
 
@@ -215,7 +217,18 @@ WHERE 1 = 1
 ORDER BY {{ ident(sort | default("id"), allow=["id", "name", "price"]) }} {% if desc %}DESC{% else %}ASC{% endif %}
 ```
 
-**`{{ ... }}` never puts the value into the SQL text.** Each output expression becomes a bound parameter, keeping its type. This includes expressions with filters or inline `if`s, such as `{{ name | upper }}` and `{{ a if flag else b }}`. The example above, with two categories, runs as `... IN ($1, $2) AND price <= $3 ORDER BY "price" DESC`. Lists and dicts are bound as JSON text.
+```sh
+curl -X POST localhost:8080/api/products/search \
+  -d '{"categories": ["coffee", "equipment"], "max_price": 30, "sort": "price", "desc": true}'
+```
+
+**`{{ ... }}` never puts the value into the SQL text.** Each output expression becomes a bound parameter, the same as a `:name` placeholder. This includes expressions with filters or inline `if`s, such as `{{ name | upper }}` and `{{ a if flag else b }}`. The example above, with two categories, runs as:
+
+```sql
+... AND category IN ($1, $2) AND price <= $3 ORDER BY "price" DESC
+```
+
+The values keep their JSON types: numbers stay numbers and booleans stay booleans. Lists and dicts are bound as JSON text. Input like `"x) OR (1=1"` is only ever compared as data.
 
 What you can use:
 
@@ -223,9 +236,10 @@ What you can use:
 | --- | --- |
 | `{{ expr }}` | Bound parameter. Undefined values bind `NULL`. |
 | `{% if %}`/`{% elif %}`/`{% else %}`, `{% for %}` (with `loop.*` and `{% else %}`), `{% set x = ... %}`, `{% raw %}`, `{% do %}`, `{% break %}`/`{% continue %}`, filters and tests | Standard Jinja for structure. |
-| `{{ ident(col, allow=["a", "b"]) }}` | A double-quoted identifier. `allow` may also be a comma-separated string. If the value isn't allowed, the response is `400`. |
+| `{{ ident(col, allow=["a", "b"]) }}` | A double-quoted identifier (`"col"`; `schema.table` becomes `"schema"."table"`). `allow` may also be a comma-separated string. If the value isn't allowed, the response is `400`. |
 | `{{ header("X-User-Id") }}` | The request header's value, bound as a parameter, or `None` if it's missing. The name is case-insensitive. |
-| `:name` | Still works, and is still **required**. |
+| `{% include %}`, `{% import %}`, `{% from %}`, `{% extends %}`/`{% block %}`, `{% macro %}` | Only with [`jinja_includes`](#includes-macros-and-template-inheritance). |
+| `:name` | Still works, and is still **required**: a missing value gets `400`. |
 | `{# comment #}` | Comment. |
 
 `ident` and `header` are reserved: request parameters with those names are hidden from templates.
@@ -234,67 +248,54 @@ Form and query-string values are always strings. Send numbers in a JSON body if 
 
 These are rejected when the template is loaded:
 
-- `{% include %}`, `{% extends %}`, `{% import %}` and `{% from %}`. A template can never load another file.
-- `{% macro %}`, `{% call %}`, `{% filter %}`, `{% with %}`, `{% block %}` and `{% set %}...{% endset %}` blocks. The plugin can't guarantee that every value inside these ends up bound.
-- `{{ value }}` inside a quoted SQL string, as with Handlebars below.
+- `{% call %}`, `{% filter %}`, `{% with %}`, `{% trans %}` and `{% set %}...{% endset %}` blocks. The plugin can't guarantee that every value inside these ends up bound.
+- `{% include %}`, `{% import %}`, `{% from %}`, `{% extends %}`, `{% block %}` and `{% macro %}`, unless `jinja_includes` is on.
+- `{{ value }}` inside a quoted SQL string, e.g. `'%{{ q }}%'`. The placeholder would just be literal text there. Write `'%' || {{ q }} || '%'` instead.
 
 The request then gets `500`, and the reason is logged (and included in the response with `verbose_errors`). A malformed `allow` list on `ident` is also a template error, never "no restriction".
-
-## Handlebars templates (`.sql.hbs`)
-
-Handlebars templates work the same way as Jinja ones; only the syntax differs. They're rendered with [Handlebars](https://handlebarsjs.com) (via [raymond](https://github.com/mailgun/raymond), which is no longer maintained) against the request parameters (body and query string). The resulting SQL then runs like any other query.
-
-```handlebars
-{{!-- products/search.sql.hbs --}}
-SELECT id, name, category, price
-FROM products
-WHERE 1 = 1
-{{#if categories}}
-  AND category IN ({{#each categories}}{{this}}{{#unless @last}}, {{/unless}}{{/each}})
-{{/if}}
-{{#if max_price}}
-  AND price <= {{max_price}}
-{{/if}}
-ORDER BY {{ident sort allow="id,name,price"}} {{#if desc}}DESC{{else}}ASC{{/if}}
-```
-
-```sh
-curl -X POST localhost:8080/api/products/search \
-  -d '{"categories": ["coffee", "equipment"], "max_price": 30, "sort": "price", "desc": true}'
-```
-
-**`{{value}}` never puts the value into the SQL text.** Each `{{value}}` becomes a bound parameter, the same as a `:name` placeholder. The example above, with two categories, runs as:
-
-```sql
-... AND category IN ($1, $2) AND price <= $3 ORDER BY "price" DESC
-```
-
-The values keep their JSON types: numbers stay numbers and booleans stay booleans. Arrays and objects are bound as JSON text. Input like `"x) OR (1=1"` is only ever compared as data.
-
-What you can use in a template:
-
-| Syntax | Result |
-| --- | --- |
-| `{{name}}`, `{{user.email}}`, `{{this}}`, `{{@index}}` | Bound parameter. A missing value binds `NULL`. |
-| `{{#if}}`, `{{#unless}}`, `{{#each}}`, `{{#with}}`, `{{#equal a "b"}}`, `{{else}}` | Standard Handlebars blocks for structure. |
-| `{{ident col allow="a,b,c"}}` | A double-quoted identifier (`"col"`; `schema.table` becomes `"schema"."table"`). If the value isn't in `allow`, the response is `400`. |
-| `{{bind (lookup obj key)}}` | Explicit binding, for the output of a helper. |
-| `:name` | Still works, and is still **required**: a missing value gets `400`. |
-| `{{!-- comment --}}` | Comment. Use the `--` form if the comment contains `}}`. |
-
-These are rejected when the template is loaded. The request then gets `500`, and the reason is logged (and included in the response with `verbose_errors`):
-
-- `{{{raw}}}` and `{{& raw}}`, which would paste text straight into the SQL.
-- Output from any helper other than `bind` and `ident`, for example `{{lookup a b}}`. Wrap it as `{{bind (lookup a b)}}`.
-- Partials.
-- `{{value}}` inside a quoted SQL string, e.g. `'%{{q}}%'`. The placeholder would just be literal text there. Write `'%' || {{q}} || '%'` instead.
 
 Notes:
 
 - **Identifiers come from the client, so always pass `allow` to `ident`.** Quoting stops injection, but without `allow` a client could still sort by any column, including ones you'd rather not expose.
-- **Guard `IN` lists with `{{#if list}}`.** An empty list would render `IN ()`, which is a syntax error.
+- **Guard `IN` lists with `{% if list %}`.** An empty list would render `IN ()`, which is a syntax error.
 - **Request parameters can't fill the placeholders templates generate.** These are named `__tpl_1`, `__tpl_2` and so on, and request parameters with that prefix are dropped.
-- **Parsed templates are cached and re-parsed when the file changes.**
+- **Parsed templates are cached and re-parsed when the file changes**, or when a template it extends changes.
+
+### Includes, macros and template inheritance
+
+With `jinja_includes` in the `sql_executor` block (`"jinja_includes": true` in JSON), templates can share SQL:
+
+```jinja
+{# layouts/list.j2 #}
+SELECT id, name, price FROM products
+WHERE 1 = 1{% block filters %}{% endblock %}
+ORDER BY {% block order %}id{% endblock %}
+```
+
+```jinja
+{# macros/filters.j2 #}
+{% macro in_list(col, values) %}{{ ident(col) }} IN ({% for v in values %}{{ v }}{% if not loop.last %}, {% endif %}{% endfor %}){% endmacro %}
+```
+
+```jinja
+{# products/catalog.sql.j2 #}
+{% extends "layouts/list.j2" %}
+{% import "macros/filters.j2" as f %}
+{% block filters %}
+  {%- if categories %} AND {{ f.in_list("category", categories) }}{% endif %}
+  {%- include "partials/price.j2" ignore missing %}
+{% endblock %}
+{% block order %}{{ super() }}, price DESC{% endblock %}
+```
+
+- **Names are relative to `root`** (for S3, to the bucket prefix) and must end in `.j2`. Hidden files and `..` are rejected. Name shared templates without `.sql` (e.g. `partials/price.j2`) so they don't also become routes.
+- **Every loaded template is checked the same way.** Its `{{ ... }}` output is bound, and the tags rejected above are rejected there too.
+- **Macro output and `{{ super() }}` are SQL**, built from the macro's (or parent block's) template text, with its values bound. Anything else is still bound: `{{ name | safe }}`, a macro's output after a filter (`{{ f.x() | trim }}`) or after `~` concatenation. Use `{%- -%}` to control whitespace instead of string filters.
+- **`include` passes the template's variables along**, including request parameters. Variables the included template sets don't leak back. `ignore missing` is supported; `without context` is not.
+- **Imports, macros and `{% set %}` outside blocks in a child template are run first**, so blocks can use them. Other text outside blocks is ignored, as in Jinja.
+- **`self.<block>()` and `{% call %}`/`caller()` aren't supported.**
+- **Recursion is limited.** More than 64 nested includes or macro calls, or 32 templates in an `extends` chain, is an error.
+- **Edits are picked up.** Included and imported templates are loaded when they're used. Templates in an `extends` chain are checked against their source on each request (for S3, against the cache).
 
 ## Request headers
 
@@ -317,17 +318,15 @@ SELECT id, total FROM orders WHERE user_id = :user_id
 
 ### Headers in templates
 
-In Jinja templates, use `{{ header("X-Tenant-Id") }}` as described above.
+Use `{{ header("X-Tenant-Id") }}`. Header names are case-insensitive:
 
-In a `.sql.hbs` template, headers are available as the `@headers` data variable. Header names are case-insensitive:
-
-```handlebars
+```jinja
 SELECT id, name FROM projects
-WHERE tenant_id = {{@headers.x-tenant-id}}
-{{#if @headers.x-include-archived}}{{else}}  AND NOT archived{{/if}}
+WHERE tenant_id = {{ header("X-Tenant-Id") }}
+{% if not header("X-Include-Archived") %}  AND NOT archived{% endif %}
 ```
 
-A missing header is falsy in `{{#if}}` and binds `NULL`. The request body and query string can't supply `@headers` values: a body field named `headers` is ordinary data. Use `@headers.<name>` directly; forms like `@../headers.x` or `@headers.x.y` are rejected.
+A missing header is `None`: falsy in `{% if %}`, and bound as `NULL`. The request body and query string can't supply header values, since `header` is reserved.
 
 ### Trusting headers
 

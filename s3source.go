@@ -174,7 +174,7 @@ func (s *s3Source) check(ctx context.Context) error {
 }
 
 func (s *s3Source) Get(_ context.Context, name string) (string, error) {
-	if !validRouteName(name) {
+	if !validQueryFile(name) {
 		return "", fs.ErrNotExist
 	}
 	prev := s.cached(name)

@@ -41,9 +41,8 @@ var errBodyTooLarge = errors.New("request body too large")
 //
 // Queries use :name placeholders, bound from the JSON or form-encoded
 // request body and the query string (body wins). Files ending in
-// .sql.hbs are Handlebars templates rendered against the same parameters
-// before execution, and files ending in .sql.j2 are Jinja templates; see
-// template.go and jinja.go for how they are kept injection-safe.
+// .sql.j2 are Jinja templates rendered against the same parameters before
+// execution; see jinja.go for how they are kept injection-safe.
 type SQLExecutor struct {
 	// Directory containing .sql files, or s3://bucket/prefix.
 	Root string `json:"root,omitempty"`
@@ -68,6 +67,10 @@ type SQLExecutor struct {
 	// Include database error messages in responses. Off by default,
 	// since they can reveal schema details.
 	VerboseErrors bool `json:"verbose_errors,omitempty"`
+	// Let Jinja templates use include, import, from, extends, block and
+	// macro. Templates are loaded from the query root by names relative to
+	// it, ending in .j2.
+	JinjaIncludes bool `json:"jinja_includes,omitempty"`
 
 	db            *sql.DB
 	style         placeholderStyle
@@ -88,7 +91,6 @@ func (SQLExecutor) CaddyModule() caddy.ModuleInfo {
 // Provision opens the database and query source.
 func (h *SQLExecutor) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
-	h.templates = &templateCache{entries: map[string]templateCacheEntry{}}
 	repl := caddy.NewReplacer()
 
 	if h.MaxBodySize <= 0 {
@@ -119,6 +121,10 @@ func (h *SQLExecutor) Provision(ctx caddy.Context) error {
 
 	if err := h.provisionSource(ctx, repl); err != nil {
 		return err
+	}
+	h.templates = newTemplateCache(nil)
+	if h.JinjaIncludes {
+		h.templates = newTemplateCache(h.source)
 	}
 
 	db, err := sql.Open(driverName, dsn)
@@ -242,7 +248,7 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		return writeError(w, http.StatusBadRequest, err.Error())
 	}
 
-	stmt, args, err := h.prepare(name, query, params, r.Header)
+	stmt, args, err := h.prepare(r.Context(), name, query, params, r.Header)
 	var badReq *badRequestError
 	if errors.As(err, &badReq) {
 		return writeError(w, http.StatusBadRequest, badReq.Error())
@@ -267,11 +273,10 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 type badRequestError struct{ error }
 
 // lookup finds the file backing a route, trying name.sql, then the
-// templates name.sql.hbs and name.sql.j2. It returns the name of the file
-// found.
+// template name.sql.j2. It returns the name of the file found.
 func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, error) {
 	var err error
-	for _, ext := range []string{"", templateExt, jinjaExt} {
+	for _, ext := range []string{"", jinjaExt} {
 		var query string
 		query, err = h.source.Get(ctx, name+ext)
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -284,15 +289,15 @@ func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, 
 // prepare turns a query file and request parameters into SQL with driver
 // placeholders plus its arguments, rendering templates (which may also
 // read request headers) first.
-func (h *SQLExecutor) prepare(name, query string, params map[string]any, header http.Header) (*statement, []any, error) {
+func (h *SQLExecutor) prepare(ctx context.Context, name, query string, params map[string]any, header http.Header) (*statement, []any, error) {
 	var bound map[string]any
 	if isTemplate(name) {
-		tpl, err := h.templates.get(name, query)
+		tpl, err := h.templates.get(ctx, name, query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parsing template: %w", err)
 		}
 		var inputErr *inputError
-		query, bound, err = tpl.render(params, header)
+		query, bound, err = tpl.render(ctx, params, header)
 		if errors.As(err, &inputErr) {
 			return nil, nil, &badRequestError{inputErr}
 		}

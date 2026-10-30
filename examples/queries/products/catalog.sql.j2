@@ -1,0 +1,11 @@
+{#
+  Uses jinja_includes: extends a layout, imports a macro, includes a partial.
+  POST /api/products/catalog  {"categories": ["coffee", "tea"], "max_price": 20}
+#}
+{% extends "layouts/list.j2" %}
+{% import "macros/filters.j2" as f %}
+{% block filters %}
+  {%- if categories %} AND {{ f.in_list("category", categories) }}{% endif %}
+  {%- include "partials/price.j2" ignore missing %}
+{% endblock %}
+{% block order %}{{ super() }}, price DESC{% endblock %}

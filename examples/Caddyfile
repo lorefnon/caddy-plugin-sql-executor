@@ -14,6 +14,7 @@
 			driver sqlite
 			dsn "file:examples/app.db?_pragma=busy_timeout(5000)"
 			timeout 10s
+			jinja_includes
 		}
 	}
 

@@ -12,11 +12,11 @@ import (
 
 func renderJinja(t *testing.T, src string, params map[string]any, header http.Header) (string, map[string]any, error) {
 	t.Helper()
-	tpl, err := parseJinjaTemplate(src)
+	tpl, _, err := parseJinjaTemplate(t.Context(), "test.sql.j2", src, nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	return tpl.render(params, header)
+	return tpl.render(t.Context(), params, header)
 }
 
 func TestJinjaRender(t *testing.T) {
@@ -136,11 +136,11 @@ func TestJinjaIdent(t *testing.T) {
 
 func TestJinjaRejects(t *testing.T) {
 	tests := map[string]string{
-		`{% include "/etc/passwd" %}`:                    "{% include %} is not supported",
+		`{% include "/etc/passwd" %}`:                    "{% include %} is not supported in SQL templates unless jinja_includes",
 		`{% extends "base.sql" %}`:                       "loading other templates",
 		`{% import "x" as y %}`:                          "{% import %} is not supported",
 		`{% from "x" import y %}`:                        "{% from %} is not supported",
-		`{% macro m() %}x{% endmacro %}`:                 "macros are not supported",
+		`{% macro m() %}x{% endmacro %}`:                 "{% macro %} is not supported in SQL templates unless jinja_includes is enabled",
 		"SELECT 1\n{% with a = 1 %}{{ a }}{% endwith %}": "line 2: {% with %} is not supported",
 		`{% filter upper %}{{ a }}{% endfilter %}`:       "{% filter %} is not supported",
 		`{% set x %}{{ a }}{% endset %}`:                 "{% set %} blocks are not supported",
@@ -149,7 +149,7 @@ func TestJinjaRejects(t *testing.T) {
 		`{% if a %}`:                                     "",
 	}
 	for src, wantMsg := range tests {
-		_, err := parseJinjaTemplate(src)
+		_, _, err := parseJinjaTemplate(t.Context(), "test.sql.j2", src, nil)
 		if err == nil || !strings.Contains(err.Error(), wantMsg) {
 			t.Errorf("parse(%q) = %v, want error containing %q", src, err, wantMsg)
 		}
@@ -192,8 +192,8 @@ SELECT id, name FROM users WHERE id = :uid{% if name %} AND name = {{ name }}{% 
 	"jinclude.sql.j2": `{% include "users.sql" %}`,
 	"pick.sql":        `SELECT 'plain' AS source`,
 	"pick.sql.j2":     `SELECT 'jinja' AS source`,
-	"pick2.sql.hbs":   `SELECT 'handlebars' AS source`,
-	"pick2.sql.j2":    `SELECT 'jinja' AS source`,
+	"jslots.sql.j2":   `SELECT {{ a }} AS a`,
+	"jmixed.sql.j2":   `SELECT id, name FROM users WHERE id = :id{% if name %} AND name = {{ name }}{% endif %}`,
 }
 
 func TestJinjaHandler(t *testing.T) {
@@ -273,12 +273,27 @@ func TestJinjaHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("lookup order is .sql, .sql.hbs, .sql.j2", func(t *testing.T) {
+	t.Run("request data cannot fill generated placeholders", func(t *testing.T) {
+		res := serve(t, h, "POST", "/jslots", `{"a": 1, "__tpl_1": "hijacked"}`, nil)
+		if res.body != `[{"a":1}]`+"\n" {
+			t.Errorf("slot override: %d %s", res.status, res.body)
+		}
+	})
+
+	t.Run(":name placeholders still work and are required", func(t *testing.T) {
+		res := serve(t, h, "POST", "/jmixed", `{"id": 1, "name": "Ada"}`, nil)
+		if res.body != ada {
+			t.Errorf("got %d %s", res.status, res.body)
+		}
+		res = serve(t, h, "POST", "/jmixed", `{"name": "Ada"}`, nil)
+		if res.status != 400 || !strings.Contains(res.body, "missing parameter(s): id") {
+			t.Errorf("missing :id: %d %s", res.status, res.body)
+		}
+	})
+
+	t.Run("lookup order is .sql, .sql.j2", func(t *testing.T) {
 		if res := serve(t, h, "POST", "/pick", "", nil); res.body != `[{"source":"plain"}]`+"\n" {
 			t.Errorf("pick: %s", res.body)
-		}
-		if res := serve(t, h, "POST", "/pick2", "", nil); res.body != `[{"source":"handlebars"}]`+"\n" {
-			t.Errorf("pick2: %s", res.body)
 		}
 		for _, target := range []string{"/jsort.sql", "/jsort.sql.j2", "/jsort.j2"} {
 			if res := serve(t, h, "POST", target, `{"sort":"id"}`, nil); res.nextCalls != 1 {
@@ -295,4 +310,18 @@ func TestJinjaHandler(t *testing.T) {
 			t.Errorf("got %d %s", res.status, res.body)
 		}
 	})
+}
+
+func TestJinjaErrorsHiddenWithoutVerbose(t *testing.T) {
+	h := newSQLiteHandler(t, nil)
+	writeTree(t, h.Root, jinjaQueries)
+	res := serve(t, h, "POST", "/jquoted", `{"q": "a"}`, nil)
+	if res.status != 500 || res.body != `{"error":"query failed"}`+"\n" {
+		t.Errorf("got %d %s", res.status, res.body)
+	}
+	// Input errors are always reported, since they are the client's to fix.
+	res = serve(t, h, "POST", "/jsort", `{"sort": "nope"}`, nil)
+	if res.status != 400 || !strings.Contains(res.body, "not one of") {
+		t.Errorf("got %d %s", res.status, res.body)
+	}
 }

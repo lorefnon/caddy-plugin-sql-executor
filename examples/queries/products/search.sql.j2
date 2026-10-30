@@ -1,6 +1,6 @@
 {#
   Jinja template: every {{ value }} becomes a bound parameter.
-  POST /api/products/search_jinja  {"categories": ["coffee"], "max_price": 20, "sort": "price"}
+  POST /api/products/search  {"categories": ["coffee"], "max_price": 20, "sort": "price"}
 #}
 SELECT id, name, category, price
 FROM products

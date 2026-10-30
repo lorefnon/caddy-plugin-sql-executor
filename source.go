@@ -32,7 +32,7 @@ func newDirSource(dir string) (*dirSource, error) {
 }
 
 func (d *dirSource) Get(_ context.Context, name string) (string, error) {
-	if !validRouteName(name) {
+	if !validQueryFile(name) {
 		return "", fs.ErrNotExist
 	}
 	b, err := fs.ReadFile(d.fsys, name)
@@ -46,11 +46,12 @@ func (d *dirSource) Get(_ context.Context, name string) (string, error) {
 	return string(b), nil
 }
 
-// validRouteName rejects names that could escape the query root or refer
-// to hidden files.
-func validRouteName(name string) bool {
-	if !fs.ValidPath(name) || !(strings.HasSuffix(name, ".sql") || strings.HasSuffix(name, ".sql"+templateExt) ||
-		strings.HasSuffix(name, ".sql"+jinjaExt)) {
+// validQueryFile accepts the names of query files and of Jinja templates
+// they load, rejecting names that could escape the query root or refer to
+// hidden files. Only names ending in .sql or .sql.j2 can back a route, so
+// a template such as partials/filters.j2 is not one.
+func validQueryFile(name string) bool {
+	if !fs.ValidPath(name) || !(strings.HasSuffix(name, ".sql") || strings.HasSuffix(name, jinjaExt)) {
 		return false
 	}
 	for _, seg := range strings.Split(name, "/") {

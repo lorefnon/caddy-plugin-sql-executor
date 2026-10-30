@@ -191,7 +191,6 @@ func TestS3SourceServesQueries(t *testing.T) {
 	fake := newFakeS3("qbucket", map[string]string{
 		"queries/one.sql":          "SELECT 1 AS n",
 		"queries/nested/three.sql": "SELECT :x AS n",
-		"queries/tpl.sql.hbs":      "SELECT {{x}} AS n",
 		"queries/jtpl.sql.j2":      "SELECT {{ x * 2 }} AS n",
 		"queries/.hidden/x.sql":    "SELECT 'hidden'",
 		"other/outside.sql":        "SELECT 'outside prefix'",
@@ -205,7 +204,6 @@ func TestS3SourceServesQueries(t *testing.T) {
 	for target, want := range map[string]string{
 		"/one":              `[{"n":1}]` + "\n",
 		"/nested/three.csv": "n\n4\n",
-		"/tpl":              `[{"n":4}]` + "\n",
 		"/jtpl":             `[{"n":8}]` + "\n",
 	} {
 		if res := serve(t, h, "POST", target, `{"x": 4}`, nil); res.status != 200 || res.body != want {
@@ -285,7 +283,7 @@ func TestS3SourceCachesMisses(t *testing.T) {
 		}
 	}
 	// One lookup per candidate file name, then cached.
-	for _, key := range []string{"nope.sql", "nope.sql.hbs", "nope.sql.j2"} {
+	for _, key := range []string{"nope.sql", "nope.sql.j2"} {
 		if _, _, misses := fake.requests(key); misses != 1 {
 			t.Errorf("%s: %d misses, want 1", key, misses)
 		}
