@@ -9,8 +9,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.6
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/dustin/go-humanize v1.1.0
+	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/nikolalohinski/gonja/v2 v2.9.1
+	github.com/pganalyze/pg_query_go/v6 v6.2.5
+	github.com/rqlite/sql v0.0.0-20261016220845-5c0832fea6e1
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
+	github.com/wasilibs/go-pgquery v0.0.0-20261027025405-3048dd293555
 	github.com/xuri/excelize/v2 v2.11.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/sync v0.24.0
@@ -96,6 +101,7 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
+	github.com/lib/pq v1.10.9 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
@@ -143,9 +149,12 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/tscert v0.0.0-20251216020129-aea342f6d747 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect
 	github.com/urfave/cli v1.22.17 // indirect
+	github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	github.com/xuri/efp v0.0.1 // indirect
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	github.com/yuin/goldmark v1.8.6 // indirect

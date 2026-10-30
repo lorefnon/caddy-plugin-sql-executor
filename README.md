@@ -376,6 +376,104 @@ Errors are returned as JSON: `{"error": "..."}`.
 | `500` | The query failed (details only with `verbose_errors`) |
 | `504` | `timeout` exceeded |
 
+## Generating an OpenAPI spec
+
+`cmd/sql-openapi` writes an OpenAPI 3.1 description of the routes under a query root. It gets request and response types by asking a database to **describe** each statement. Nothing is executed.
+
+```sh
+go run ./cmd/sql-openapi -config examples/sql-openapi.yaml -out openapi.yaml
+go run ./cmd/sql-openapi -root queries -driver postgres -dsn "$DATABASE_URL"
+go run ./cmd/sql-openapi -root queries -driver postgres -schema schema.sql
+```
+
+- **`-dsn`** describes statements against a live database.
+- **`-schema`** loads a file of DDL into a throwaway database first, so no running database is needed. For SQLite that's a temporary file. For PostgreSQL it's an embedded server, downloaded on first use and cached in `~/.embedded-postgres-go`.
+- Flags override the config file. `$VAR` and `${VAR}` are expanded in the DSN.
+
+Each route gets a `POST` operation:
+
+- **Request body** (JSON and form): one property per `:name` placeholder, all required and nullable. `@header` placeholders become required header parameters instead.
+- **Response**: an array of rows for JSON and YAML, plus CSV and XLSX bodies. There's a row schema per route under `components/schemas`, and shared error responses.
+- **Description**: the file's `-- @description` lines, if any. Otherwise the leading `--` comment lines (other than directives), or a template's opening `{# #}` comment.
+
+How types are inferred depends on the database:
+
+| | PostgreSQL | SQLite |
+| --- | --- | --- |
+| Column types | From the database, for all columns | Declared type for table columns; expressions are typed by parsing the SQL (`count(*)` is an integer, `upper(x)` a string, and so on) |
+| Parameter types | From the database | From how each placeholder is used: compared with a column, inserted into one, assigned with `SET`, in `LIMIT`, and so on |
+| Enums | Enum values become an `enum` | n/a |
+
+**Nullability** is worked out per column, from the query plan and the SQL:
+
+- **Table columns** are non-null when declared `NOT NULL`, unless an outer join (`LEFT`, `RIGHT` or `FULL`) puts their table on the nullable side. Each join is tracked by alias, so a self-join is handled. A `LEFT JOIN` that the planner turns into an inner join (because a `WHERE` condition rejects nulls) adds no nulls.
+- **Expressions** are non-null when they're sure to be, for example `count(*)`, `coalesce(x, 'default')`, arithmetic and string functions over non-null values, a `CASE` whose branches and `ELSE` are all non-null, and `max(x)` over a non-null column with `GROUP BY`.
+- **Everything else** is nullable. That includes aggregates without `GROUP BY` (which return a row even for no input), columns under `ROLLUP`, `CUBE` or `GROUPING SETS`, division in SQLite (`x / 0` is `NULL`), date functions in SQLite (invalid input gives `NULL`), and scalar subqueries.
+
+On PostgreSQL, this reads the statement's generic plan: `EXPLAIN (GENERIC_PLAN, VERBOSE)` on PostgreSQL 16 or later, or a prepared statement forced to a generic plan on versions 12–15. Expressions in the plan are parsed with PostgreSQL's own parser ([libpg_query](https://github.com/pganalyze/libpg_query), run as WebAssembly, so no cgo is needed). On SQLite, the SQL is parsed with [rqlite/sql](https://github.com/rqlite/sql) and checked against `EXPLAIN QUERY PLAN`. Neither runs the statement.
+
+Anything the analysis can't follow, such as columns of a materialized CTE, falls back to the safe answer: nullable if the query has outer joins or grouping sets.
+
+Types match what the handler actually returns. For example, `numeric` is a string with `format: decimal`, `bytea` is base64, `json`/`jsonb` is any JSON value, and arrays, `time` and `interval` are text.
+
+### Annotating endpoints, columns and parameters
+
+To document an endpoint, or when inference falls short, add `--` comments next to the query, much like `@header`:
+
+```sql
+-- @description Sales per category.
+-- @description
+-- @description Prices are in **cents**.
+-- @column avg_price = {description: "Average price, rounded to cents."}
+-- @column total = [number, "null"]
+-- @column "Unit Price" = {type: string, format: decimal}
+-- @param :since = {type: string, format: date}
+SELECT ...
+```
+
+- **`@description`** sets the operation's description, taking the place of the leading comment. Each line adds a line of Markdown; a bare `-- @description` adds a blank one. Text after the first space is kept as written, so it can be indented.
+- **The schema after `=` is YAML**: a type name (`integer`), a list of them (`[integer, "null"]`), or a schema using `type`, `format`, `contentEncoding`, `description`, `enum`, `items`, `properties`, `required`, `anyOf` or `$ref`. Values with a comma need quotes.
+- **Keys you give replace the inferred ones.** A schema with only a `description` keeps the inferred type and nullability. Anything about the type replaces the whole inferred type, nullability included: `integer` means a non-null integer.
+- **Columns** are named as they appear in the result; quote names that contain spaces. **Parameters** are `:name` placeholders or, in templates, request properties.
+- **In templates**, annotations are read from the rendered SQL, so they can sit inside `{% if %}` along with the columns they describe. A template with no samples has no rendered SQL, so its annotations aren't seen. Every sample must render the same `@description`.
+- **Mistakes are errors:** an annotation naming no column or parameter, an unknown type such as `int`, an unsupported keyword, or a `@param` for a placeholder that `@header` fills.
+
+The handler ignores these comments. Schemas in the config file's `columns` and `params` are applied on top, the same way.
+
+### Config file
+
+```yaml
+info: { title: Products API, version: 1.0.0 }
+servers: [{ url: https://example.com/api }]
+root: queries            # relative to this file
+driver: sqlite
+schema: schema.sql       # or dsn: ${DATABASE_URL}
+# postgres_version: "16" # PostgreSQL major version for schema (default: latest)
+jinja_includes: true
+queries:                 # keyed by file or by route
+  products/search.sql.j2:
+    samples:             # template parameters to render with
+      - {}
+      - { categories: [coffee, tea], max_price: 20.5, sort: price, desc: true }
+    headers: { X-Tenant-Id: "1" }   # headers set while rendering
+  category_summary.sql:
+    columns:             # like -- @column, applied after annotations
+      avg_price: { type: number }
+  products.sql:
+    params:              # like -- @param
+      category: { type: [string, "null"] }
+```
+
+**Templates** produce different SQL for different inputs, so they're described from **samples**:
+
+- Each sample is rendered as if it were a request, then described.
+- Request properties are the union of the sample keys, typed by the sample values (e.g. `categories: [coffee]` becomes an array of strings). None are required.
+- If the samples produce different columns, the row schema is an `anyOf` of the shapes.
+- `header("...")` calls become optional header parameters.
+- A template with no samples gets an open object for the request body and for rows.
+
+If a file can't be described (a SQL error, or a sample that fails to render), the error is printed and the file is left out of the spec. The command then exits with status 1. The same happens when a `queries` entry matches no file.
+
 ## Security notes
 
 - **The plugin does no authentication or authorization.** Anyone who can reach a route can run that query. Protect routes with Caddy's `basic_auth`, `forward_auth`, mTLS or a `remote_ip` matcher.
@@ -391,4 +489,10 @@ go test -short ./...              # skip the end-to-end test, which binds :9080 
 
 # PostgreSQL integration tests run when a DSN is provided:
 SQL_EXECUTOR_TEST_POSTGRES_DSN='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable' go test ./...
+
+# Or run the sql-openapi PostgreSQL tests against an embedded server (downloaded on first use):
+SQL_OPENAPI_TEST_EMBEDDED_POSTGRES=1 go test ./cmd/sql-openapi
+
+# Regenerate the sql-openapi golden file after an intended change:
+go test ./cmd/sql-openapi -update
 ```

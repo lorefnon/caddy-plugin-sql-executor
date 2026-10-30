@@ -1,0 +1,592 @@
+openapi: 3.1.0
+info:
+  title: Example products API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/api
+paths:
+  /category_summary:
+    post:
+      operationId: category_summary
+      description: Product counts and prices per category.
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategorySummaryRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategorySummaryRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products:
+    post:
+      operationId: products
+      description: |-
+        List products, optionally filtered by category.
+        POST /api/products            {"category": "coffee"}
+        POST /api/products.csv        {"category": null}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                category:
+                  type:
+                    - string
+                    - "null"
+              required:
+                - category
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                category:
+                  type:
+                    - string
+                    - "null"
+              required:
+                - category
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products/by_id:
+    post:
+      operationId: products_by_id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type:
+                    - integer
+                    - "null"
+                  format: int64
+              required:
+                - id
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                id:
+                  type:
+                    - integer
+                    - "null"
+                  format: int64
+              required:
+                - id
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsByIdRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsByIdRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products/catalog:
+    post:
+      operationId: products_catalog
+      description: |-
+        Uses jinja_includes: extends a layout, imports a macro, includes a partial.
+        POST /api/products/catalog  {"categories": ["coffee", "tea"], "max_price": 20}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: array
+                  items:
+                    type: string
+                max_price:
+                  type: integer
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: array
+                  items:
+                    type: string
+                max_price:
+                  type: integer
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsCatalogRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsCatalogRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products/create:
+    post:
+      operationId: products_create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type:
+                    - string
+                    - "null"
+                category:
+                  type:
+                    - string
+                    - "null"
+                price:
+                  type:
+                    - number
+                    - "null"
+                  format: double
+              required:
+                - name
+                - category
+                - price
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                name:
+                  type:
+                    - string
+                    - "null"
+                category:
+                  type:
+                    - string
+                    - "null"
+                price:
+                  type:
+                    - number
+                    - "null"
+                  format: double
+              required:
+                - name
+                - category
+                - price
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsCreateRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsCreateRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products/mine:
+    post:
+      operationId: products_mine
+      description: |-
+        Products added by the calling user. X-User-Id would normally be set by an
+        auth layer in front of this route (e.g. forward_auth ... copy_headers).
+        POST /api/products/mine   with header  X-User-Id: 1
+      parameters:
+        - name: X-User-Id
+          in: header
+          description: Supplies :user_id.
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsMineRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsMineRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+  /products/search:
+    post:
+      operationId: products_search
+      description: |-
+        Jinja template: every {{ value }} becomes a bound parameter.
+        POST /api/products/search  {"categories": ["coffee"], "max_price": 20, "sort": "price"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: array
+                  items:
+                    type: string
+                desc:
+                  type: boolean
+                in_stock:
+                  type: boolean
+                max_price:
+                  type: number
+                sort:
+                  type: string
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: array
+                  items:
+                    type: string
+                desc:
+                  type: boolean
+                in_stock:
+                  type: boolean
+                max_price:
+                  type: number
+                sort:
+                  type: string
+      responses:
+        "200":
+          description: The rows the query returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsSearchRow'
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/yaml:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductsSearchRow'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "406":
+          $ref: '#/components/responses/NotAcceptable'
+        "413":
+          $ref: '#/components/responses/PayloadTooLarge'
+        "500":
+          $ref: '#/components/responses/QueryFailed'
+        "504":
+          $ref: '#/components/responses/Timeout'
+components:
+  schemas:
+    CategorySummaryRow:
+      type: object
+      properties:
+        category:
+          type: string
+        products:
+          type: integer
+        avg_price:
+          type: number
+          description: Average price, rounded to cents.
+        in_stock:
+          type: integer
+      required:
+        - category
+        - products
+        - avg_price
+        - in_stock
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+    ProductsByIdRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        category:
+          type: string
+        price:
+          type: number
+          format: double
+        in_stock:
+          type: boolean
+        added_on:
+          type: string
+          format: date
+      required:
+        - id
+        - name
+        - category
+        - price
+        - in_stock
+        - added_on
+    ProductsCatalogRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - id
+        - name
+        - price
+    ProductsCreateRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        category:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - id
+        - name
+        - category
+        - price
+    ProductsMineRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        category:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - id
+        - name
+        - category
+        - price
+    ProductsRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        category:
+          type: string
+        price:
+          type: number
+          format: double
+        in_stock:
+          type: boolean
+        added_on:
+          type: string
+          format: date
+      required:
+        - id
+        - name
+        - category
+        - price
+        - in_stock
+        - added_on
+    ProductsSearchRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        category:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - id
+        - name
+        - category
+        - price
+  responses:
+    BadRequest:
+      description: Missing parameters, a malformed body, or an unsupported content type.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotAcceptable:
+      description: None of the accepted media types can be produced.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: The request body is too large.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    QueryFailed:
+      description: The query failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Timeout:
+      description: The query timed out.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

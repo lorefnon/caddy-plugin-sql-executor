@@ -1,0 +1,22 @@
+# OpenAPI spec for the example queries. Run from the repository root:
+#   go run ./cmd/sql-openapi -config examples/sql-openapi.yaml -out openapi.yaml
+info:
+  title: Example products API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/api
+root: queries
+driver: sqlite
+# Describe statements against a throwaway database built from this file.
+# To use a real database instead: dsn: ${DATABASE_URL}
+schema: seed.sql
+jinja_includes: true
+queries:
+  # Templates are rendered with each sample; the results are combined.
+  products/search.sql.j2:
+    samples:
+      - {}
+      - { categories: [coffee, tea], max_price: 20.5, sort: price, desc: true, in_stock: true }
+  products/catalog.sql.j2:
+    samples:
+      - { categories: [coffee], max_price: 20 }

@@ -19,6 +19,10 @@ SELECT '-- @header :nope = Inside-String', :uid, :tenant, :other`, styleDollar)
 	if !reflect.DeepEqual(stmt.Headers, want) {
 		t.Errorf("headers %v, want %v", stmt.Headers, want)
 	}
+	wantDirectives := []string{"@header :uid = X-User-Id", "@header :tenant=X-Tenant", "@headers are set by the proxy (ordinary comment)"}
+	if !reflect.DeepEqual(stmt.Directives, wantDirectives) {
+		t.Errorf("directives %q, want %q", stmt.Directives, wantDirectives)
+	}
 	// Directives stay in the SQL as ordinary comments.
 	if !strings.HasPrefix(stmt.SQL, "-- @header :uid = X-User-Id\n") || !strings.Contains(stmt.SQL, "$1, $2, $3") {
 		t.Errorf("sql %q", stmt.SQL)

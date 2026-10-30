@@ -91,6 +91,12 @@ func parseJinjaTemplate(ctx context.Context, name, src string, cache *templateCa
 }
 
 func (t *jinjaTemplate) render(ctx context.Context, params map[string]any, header http.Header) (string, map[string]any, error) {
+	return t.renderWith(ctx, params, header, nil)
+}
+
+// renderWith is render, calling onHeader (if not nil) with the name of
+// each header the template reads.
+func (t *jinjaTemplate) renderWith(ctx context.Context, params map[string]any, header http.Header, onHeader func(string)) (string, map[string]any, error) {
 	bound := map[string]any{}
 	var inputErr *inputError
 	fail := func(msg string) error {
@@ -143,6 +149,9 @@ func (t *jinjaTemplate) render(ctx context.Context, params map[string]any, heade
 	data[jinjaHeaderFunc] = func(va *exec.VarArgs) (any, error) {
 		if len(va.Args) != 1 || !va.Args[0].IsString() {
 			return nil, errors.New("header expects a header name")
+		}
+		if onHeader != nil {
+			onHeader(va.Args[0].String())
 		}
 		vs := header.Values(va.Args[0].String())
 		if len(vs) == 0 {

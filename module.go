@@ -105,15 +105,11 @@ func (h *SQLExecutor) Provision(ctx caddy.Context) error {
 		h.defaultFormat = f
 	}
 
-	var driverName string
-	switch strings.ToLower(h.Driver) {
-	case "postgres", "postgresql", "pgx":
-		driverName, h.style = "pgx", styleDollar
-	case "sqlite", "sqlite3":
-		driverName, h.style = "sqlite", styleQuestion
-	default:
-		return fmt.Errorf("unsupported driver %q: use postgres or sqlite", h.Driver)
+	driverName, style, err := parseDriver(h.Driver)
+	if err != nil {
+		return err
 	}
+	h.style = style
 	dsn := repl.ReplaceKnown(h.DSN, "")
 	if dsn == "" {
 		return errors.New("dsn is required")
@@ -190,6 +186,18 @@ func (h *SQLExecutor) provisionSource(ctx caddy.Context, repl *caddy.Replacer) e
 	}
 	h.source = src
 	return nil
+}
+
+// parseDriver maps a configured driver name to the database/sql driver
+// that implements it and the placeholder style its queries use.
+func parseDriver(driver string) (string, placeholderStyle, error) {
+	switch strings.ToLower(driver) {
+	case "postgres", "postgresql", "pgx":
+		return "pgx", styleDollar, nil
+	case "sqlite", "sqlite3":
+		return "sqlite", styleQuestion, nil
+	}
+	return "", 0, fmt.Errorf("unsupported driver %q: use postgres or sqlite", driver)
 }
 
 // Validate checks the configuration.
@@ -290,28 +298,8 @@ func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, 
 // placeholders plus its arguments, rendering templates (which may also
 // read request headers) first.
 func (h *SQLExecutor) prepare(ctx context.Context, name, query string, params map[string]any, header http.Header) (*statement, []any, error) {
-	var bound map[string]any
-	if isTemplate(name) {
-		tpl, err := h.templates.get(ctx, name, query)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parsing template: %w", err)
-		}
-		var inputErr *inputError
-		query, bound, err = tpl.render(ctx, params, header)
-		if errors.As(err, &inputErr) {
-			return nil, nil, &badRequestError{inputErr}
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("rendering template: %w", err)
-		}
-		params = mergeBoundParams(params, bound)
-	}
-
-	stmt, err := compile(query, h.style)
+	stmt, params, err := compileQuery(ctx, h.templates, h.style, name, query, params, header, nil)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkBoundPlaceholders(stmt, bound); err != nil {
 		return nil, nil, err
 	}
 	if err := stmt.headerParams(params, header); err != nil {
@@ -322,6 +310,38 @@ func (h *SQLExecutor) prepare(ctx context.Context, name, query string, params ma
 		return nil, nil, &badRequestError{err}
 	}
 	return stmt, args, nil
+}
+
+// compileQuery renders a template query (other queries are used as they
+// are) and compiles the result. It returns the statement and the request
+// parameters merged with the values the template bound. onHeader, if not
+// nil, is called with each header name the template reads.
+func compileQuery(ctx context.Context, templates *templateCache, style placeholderStyle, name, query string, params map[string]any, header http.Header, onHeader func(string)) (*statement, map[string]any, error) {
+	var bound map[string]any
+	if isTemplate(name) {
+		tpl, err := templates.get(ctx, name, query)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing template: %w", err)
+		}
+		var inputErr *inputError
+		query, bound, err = tpl.renderWith(ctx, params, header, onHeader)
+		if errors.As(err, &inputErr) {
+			return nil, nil, &badRequestError{inputErr}
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("rendering template: %w", err)
+		}
+		params = mergeBoundParams(params, bound)
+	}
+
+	stmt, err := compile(query, style)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkBoundPlaceholders(stmt, bound); err != nil {
+		return nil, nil, err
+	}
+	return stmt, params, nil
 }
 
 func (h *SQLExecutor) execute(ctx context.Context, w http.ResponseWriter, name string, f format, query string, args []any) error {

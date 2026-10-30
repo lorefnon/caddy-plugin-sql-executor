@@ -36,6 +36,10 @@ type statement struct {
 	// Headers maps parameter names to the request headers that supply
 	// them, as declared by "-- @header :name = Header-Name" comments.
 	Headers map[string]string
+	// Directives holds the text of each -- comment that starts with @,
+	// trimmed, in order. Only @header is acted on here; the others are
+	// for tools that read the query, such as cmd/sql-openapi.
+	Directives []string
 }
 
 var (
@@ -66,6 +70,7 @@ func compile(query string, style placeholderStyle) (*statement, error) {
 		params  []string
 		index   = map[string]int{}
 		headers map[string]string
+		notes   []string
 	)
 	out.Grow(len(query))
 
@@ -95,6 +100,9 @@ func compile(query string, style placeholderStyle) (*statement, error) {
 				end = n
 			} else {
 				end += i
+			}
+			if text := strings.TrimSpace(query[i+2 : end]); strings.HasPrefix(text, "@") {
+				notes = append(notes, text)
 			}
 			name, header, ok, err := parseHeaderDirective(query[i+2 : end])
 			if err != nil {
@@ -159,7 +167,7 @@ func compile(query string, style placeholderStyle) (*statement, error) {
 			return nil, fmt.Errorf("@header maps %s to :%s, but the query does not use :%s", header, name, name)
 		}
 	}
-	return &statement{SQL: out.String(), Params: params, Headers: headers}, nil
+	return &statement{SQL: out.String(), Params: params, Headers: headers, Directives: notes}, nil
 }
 
 // headerParams sets the parameters declared by @header directives from the
