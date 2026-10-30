@@ -28,8 +28,7 @@ func init() {
 }
 
 const (
-	defaultMaxBodySize     = 1 << 20
-	defaultRefreshInterval = time.Minute
+	defaultMaxBodySize = 1 << 20
 )
 
 var errBodyTooLarge = errors.New("request body too large")
@@ -43,7 +42,8 @@ var errBodyTooLarge = errors.New("request body too large")
 // Queries use :name placeholders, bound from the JSON or form-encoded
 // request body and the query string (body wins). Files ending in
 // .sql.hbs are Handlebars templates rendered against the same parameters
-// before execution; see template.go for how they are kept injection-safe.
+// before execution, and files ending in .sql.j2 are Jinja templates; see
+// template.go and jinja.go for how they are kept injection-safe.
 type SQLExecutor struct {
 	// Directory containing .sql files, or s3://bucket/prefix.
 	Root string `json:"root,omitempty"`
@@ -75,7 +75,6 @@ type SQLExecutor struct {
 	templates     *templateCache
 	defaultFormat format
 	logger        *zap.Logger
-	cancel        context.CancelFunc
 }
 
 // CaddyModule returns the Caddy module information.
@@ -176,19 +175,13 @@ func (h *SQLExecutor) provisionSource(ctx caddy.Context, repl *caddy.Replacer) e
 		return err
 	}
 
-	src := newS3Source(client, bucket, prefix, h.logger)
-	loadCtx, cancelLoad := context.WithTimeout(ctx, 30*time.Second)
-	defer cancelLoad()
-	if err := src.refresh(loadCtx); err != nil {
-		return fmt.Errorf("loading queries from S3: %w", err)
+	src := newS3Source(client, bucket, prefix, &cfg, h.logger)
+	// Queries load lazily, so S3 being unreachable now is not fatal.
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := src.check(checkCtx); err != nil {
+		h.logger.Warn("S3 bucket is not reachable yet", zap.String("bucket", bucket), zap.Error(err))
 	}
-	interval := time.Duration(cfg.RefreshInterval)
-	if interval <= 0 {
-		interval = defaultRefreshInterval
-	}
-	watchCtx, cancel := context.WithCancel(context.Background())
-	h.cancel = cancel
-	go src.watch(watchCtx, interval)
 	h.source = src
 	return nil
 }
@@ -201,11 +194,8 @@ func (h *SQLExecutor) Validate() error {
 	return nil
 }
 
-// Cleanup stops background work and closes the database pool.
+// Cleanup closes the database pool.
 func (h *SQLExecutor) Cleanup() error {
-	if h.cancel != nil {
-		h.cancel()
-	}
 	if h.db != nil {
 		return h.db.Close()
 	}
@@ -276,15 +266,19 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 // query file.
 type badRequestError struct{ error }
 
-// lookup finds the file backing a route: name.sql, or failing that the
-// template name.sql.hbs. It returns the name of the file found.
+// lookup finds the file backing a route, trying name.sql, then the
+// templates name.sql.hbs and name.sql.j2. It returns the name of the file
+// found.
 func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, error) {
-	query, err := h.source.Get(ctx, name)
-	if errors.Is(err, fs.ErrNotExist) {
-		name += templateExt
-		query, err = h.source.Get(ctx, name)
+	var err error
+	for _, ext := range []string{"", templateExt, jinjaExt} {
+		var query string
+		query, err = h.source.Get(ctx, name+ext)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return name + ext, query, err
+		}
 	}
-	return name, query, err
+	return name, "", err
 }
 
 // prepare turns a query file and request parameters into SQL with driver
@@ -292,7 +286,7 @@ func (h *SQLExecutor) lookup(ctx context.Context, name string) (string, string, 
 // read request headers) first.
 func (h *SQLExecutor) prepare(name, query string, params map[string]any, header http.Header) (*statement, []any, error) {
 	var bound map[string]any
-	if strings.HasSuffix(name, templateExt) {
+	if isTemplate(name) {
 		tpl, err := h.templates.get(name, query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parsing template: %w", err)

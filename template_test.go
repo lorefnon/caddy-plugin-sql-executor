@@ -81,18 +81,18 @@ ORDER BY {{ident sort allow="name, created_at"}} LIMIT {{limit}}`)
 		t.Fatal(err)
 	}
 	wantSQL := `SELECT * FROM t WHERE 1=1
- AND name = :__hbs_1
- AND id IN (:__hbs_2, :__hbs_3)
+ AND name = :__tpl_1
+ AND id IN (:__tpl_2, :__tpl_3)
 
-ORDER BY "created_at" LIMIT :__hbs_4`
+ORDER BY "created_at" LIMIT :__tpl_4`
 	if sql != wantSQL {
 		t.Errorf("sql\n got: %s\nwant: %s", sql, wantSQL)
 	}
 	wantBound := map[string]any{
-		"__hbs_1": "O'Brien <b>", // bound verbatim: no HTML escaping, no quoting
-		"__hbs_2": int64(3),
-		"__hbs_3": int64(5),
-		"__hbs_4": int64(10),
+		"__tpl_1": "O'Brien <b>", // bound verbatim: no HTML escaping, no quoting
+		"__tpl_2": int64(3),
+		"__tpl_3": int64(5),
+		"__tpl_4": int64(10),
 	}
 	if !reflect.DeepEqual(bound, wantBound) {
 		t.Errorf("bound %#v\nwant %#v", bound, wantBound)
@@ -103,13 +103,13 @@ ORDER BY "created_at" LIMIT :__hbs_4`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(sql, `ORDER BY "name" LIMIT :__hbs_1`) || len(bound) != 1 {
+	if !strings.HasSuffix(sql, `ORDER BY "name" LIMIT :__tpl_1`) || len(bound) != 1 {
 		t.Errorf("second render: %s %v", sql, bound)
 	}
 
 	_, _, err = tpl.render(map[string]any{"sort": "password", "limit": int64(1)}, nil)
 	var inputErr *inputError
-	if !errors.As(err, &inputErr) || !strings.Contains(err.Error(), `"password" is not one of name, created_at`) {
+	if !errors.As(err, &inputErr) || !strings.Contains(err.Error(), `"password" is not one of name,created_at`) {
 		t.Errorf("disallowed ident: %v", err)
 	}
 }
@@ -123,7 +123,7 @@ func TestRenderTemplateMissingValueBindsNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sql != "SELECT :__hbs_1, :__hbs_2" || bound["__hbs_1"] != nil || bound["__hbs_2"] != nil || len(bound) != 2 {
+	if sql != "SELECT :__tpl_1, :__tpl_2" || bound["__tpl_1"] != nil || bound["__tpl_2"] != nil || len(bound) != 2 {
 		t.Errorf("got %q %v", sql, bound)
 	}
 }
@@ -148,11 +148,11 @@ ORDER BY {{ident @headers.x-sort allow="name"}}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSQL := "SELECT :__hbs_1, :__hbs_2\n:__hbs_3\n:__hbs_4\nORDER BY \"name\""
+	wantSQL := "SELECT :__tpl_1, :__tpl_2\n:__tpl_3\n:__tpl_4\nORDER BY \"name\""
 	if sql != wantSQL {
 		t.Errorf("sql\n got: %q\nwant: %q", sql, wantSQL)
 	}
-	wantBound := map[string]any{"__hbs_1": "42", "__hbs_2": "42", "__hbs_3": "a, b", "__hbs_4": nil}
+	wantBound := map[string]any{"__tpl_1": "42", "__tpl_2": "42", "__tpl_3": "a, b", "__tpl_4": nil}
 	if !reflect.DeepEqual(bound, wantBound) {
 		t.Errorf("bound %#v\nwant %#v", bound, wantBound)
 	}
@@ -170,10 +170,10 @@ func TestRenderTemplateAbsentHeadersCannotBeSpoofed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sql != ":__hbs_1||:__hbs_2" {
+	if sql != ":__tpl_1||:__tpl_2" {
 		t.Errorf("sql %q", sql)
 	}
-	if want := map[string]any{"__hbs_1": nil, "__hbs_2": nil}; !reflect.DeepEqual(bound, want) {
+	if want := map[string]any{"__tpl_1": nil, "__tpl_2": nil}; !reflect.DeepEqual(bound, want) {
 		t.Errorf("bound %#v, want %#v", bound, want)
 	}
 }
@@ -268,7 +268,7 @@ func TestTemplateHandler(t *testing.T) {
 			t.Errorf("ident injection: status %d body %s", res.status, res.body)
 		}
 		// Request data cannot fill generated placeholders.
-		res = serve(t, h, "POST", "/slots", `{"a": 1, "__hbs_1": "hijacked"}`, nil)
+		res = serve(t, h, "POST", "/slots", `{"a": 1, "__tpl_1": "hijacked"}`, nil)
 		if res.body != `[{"a":1}]`+"\n" {
 			t.Errorf("slot override: %s", res.body)
 		}

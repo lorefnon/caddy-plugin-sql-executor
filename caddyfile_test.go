@@ -30,7 +30,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 			access_key_id minio
 			secret_access_key secret
 			session_token tok
-			refresh_interval 30s
+			cache_size_mb 128
+			cache_ttl 30s
 		}
 	}`)
 	var got SQLExecutor
@@ -54,7 +55,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 			AccessKeyID:     "minio",
 			SecretAccessKey: "secret",
 			SessionToken:    "tok",
-			RefreshInterval: caddy.Duration(30 * time.Second),
+			CacheSizeMB:     128,
+			CacheTTL:        caddy.Duration(30 * time.Second),
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -75,7 +77,8 @@ func TestUnmarshalCaddyfileErrors(t *testing.T) {
 		"sql_executor {\ns3 x {\n}\n}",
 		"sql_executor {\ns3 {\nbogus\n}\n}",
 		"sql_executor {\ns3 {\nuse_path_style no\n}\n}",
-		"sql_executor {\ns3 {\nrefresh_interval\n}\n}",
+		"sql_executor {\ns3 {\ncache_ttl\n}\n}",
+		"sql_executor {\ns3 {\ncache_size_mb lots\n}\n}",
 	} {
 		var h SQLExecutor
 		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {

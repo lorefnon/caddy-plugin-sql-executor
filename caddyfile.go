@@ -40,7 +40,8 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	        access_key_id     <id>
 //	        secret_access_key <secret>
 //	        session_token     <token>
-//	        refresh_interval  <duration>
+//	        cache_size_mb     <MiB>
+//	        cache_ttl         <duration>
 //	    }
 //	}
 func (h *SQLExecutor) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -140,8 +141,12 @@ func (c *S3Config) unmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err := singleArg(d, &c.SessionToken); err != nil {
 				return err
 			}
-		case "refresh_interval":
-			if err := durationArg(d, &c.RefreshInterval); err != nil {
+		case "cache_size_mb":
+			if err := intArg(d, &c.CacheSizeMB); err != nil {
+				return err
+			}
+		case "cache_ttl":
+			if err := durationArg(d, &c.CacheTTL); err != nil {
 				return err
 			}
 		default:

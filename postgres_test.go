@@ -86,6 +86,12 @@ RETURNING id, customer, qty, total, meta`,
 		"dollar.sql":        "SELECT $q$ :not_a_param $q$ AS s, :real::int AS n",
 		"slow.sql":          "SELECT pg_sleep(5)",
 		"broken.sql":        "SELEC 1",
+		"orders/jsearch.sql.j2": `SELECT id, customer FROM sqlx_orders
+WHERE true
+{% if ids %} AND id IN ({% for id in ids %}{{ id }}{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
+{% if paid is not none %} AND paid = {{ paid }}{% endif %}
+{% if meta %} AND meta @> {{ meta }}::jsonb{% endif %}
+ORDER BY {{ ident(sort, allow=["id", "customer"]) }} DESC`,
 		"orders/search.sql.hbs": `SELECT id, customer FROM sqlx_orders
 WHERE true
 {{#if ids}} AND id IN ({{#each ids}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}){{/if}}
@@ -168,6 +174,21 @@ ORDER BY {{ident sort allow="id,customer"}} DESC`,
 		res = serve(t, h, "POST", "/orders/search", `{"paid": true, "meta": {"rush": true}, "sort": "customer"}`, nil)
 		if res.status != 200 || res.body != `[{"id":1,"customer":"acme"}]`+"\n" {
 			t.Errorf("typed bool and jsonb object: %d %s", res.status, res.body)
+		}
+	})
+
+	t.Run("jinja template", func(t *testing.T) {
+		res := serve(t, h, "POST", "/orders/jsearch", `{"ids": [1, 2], "sort": "id", "paid": null}`, nil)
+		if res.status != 200 || res.body != `[{"id":2,"customer":"globex"},{"id":1,"customer":"acme"}]`+"\n" {
+			t.Errorf("IN list: %d %s", res.status, res.body)
+		}
+		res = serve(t, h, "POST", "/orders/jsearch", `{"paid": false, "meta": null, "sort": "customer"}`, nil)
+		if res.status != 200 || res.body != `[{"id":2,"customer":"globex"}]`+"\n" {
+			t.Errorf("typed false: %d %s", res.status, res.body)
+		}
+		res = serve(t, h, "POST", "/orders/jsearch", `{"paid": null, "meta": {"rush": true}, "sort": "id"}`, nil)
+		if res.status != 200 || res.body != `[{"id":1,"customer":"acme"}]`+"\n" {
+			t.Errorf("jsonb object: %d %s", res.status, res.body)
 		}
 	})
 

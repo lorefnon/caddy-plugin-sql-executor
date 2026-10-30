@@ -49,7 +49,8 @@ func (d *dirSource) Get(_ context.Context, name string) (string, error) {
 // validRouteName rejects names that could escape the query root or refer
 // to hidden files.
 func validRouteName(name string) bool {
-	if !fs.ValidPath(name) || !(strings.HasSuffix(name, ".sql") || strings.HasSuffix(name, ".sql"+templateExt)) {
+	if !fs.ValidPath(name) || !(strings.HasSuffix(name, ".sql") || strings.HasSuffix(name, ".sql"+templateExt) ||
+		strings.HasSuffix(name, ".sql"+jinjaExt)) {
 		return false
 	}
 	for _, seg := range strings.Split(name, "/") {

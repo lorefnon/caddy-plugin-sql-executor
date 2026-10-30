@@ -1,0 +1,17 @@
+{#
+  Jinja template: every {{ value }} becomes a bound parameter.
+  POST /api/products/search_jinja  {"categories": ["coffee"], "max_price": 20, "sort": "price"}
+#}
+SELECT id, name, category, price
+FROM products
+WHERE 1 = 1
+{% if categories %}
+  AND category IN ({% for c in categories %}{{ c }}{% if not loop.last %}, {% endif %}{% endfor %})
+{% endif %}
+{% if max_price %}
+  AND price <= {{ max_price }}
+{% endif %}
+{% if in_stock %}
+  AND in_stock
+{% endif %}
+ORDER BY {{ ident(sort | default("id"), allow=["id", "name", "price"]) }} {% if desc %}DESC{% else %}ASC{% endif %}

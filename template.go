@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +20,27 @@ import (
 const templateExt = ".hbs"
 
 // boundParamPrefix names the placeholders generated for {{value}}
-// expressions; request parameters with this prefix are discarded.
-const boundParamPrefix = "__hbs_"
+// expressions in templates; request parameters with this prefix are
+// discarded.
+const boundParamPrefix = "__tpl_"
+
+// queryTemplate renders a query file to SQL with :name placeholders, plus
+// values for the placeholders it generated.
+type queryTemplate interface {
+	render(params map[string]any, header http.Header) (string, map[string]any, error)
+}
+
+// isTemplate reports whether a query file name is a template.
+func isTemplate(name string) bool {
+	return strings.HasSuffix(name, templateExt) || strings.HasSuffix(name, jinjaExt)
+}
+
+func parseQueryTemplate(name, src string) (queryTemplate, error) {
+	if strings.HasSuffix(name, jinjaExt) {
+		return parseJinjaTemplate(src)
+	}
+	return parseSQLTemplate(src)
+}
 
 // sqlHelpers are the helpers whose output may appear directly in SQL.
 var sqlHelpers = map[string]bool{"bind": true, "ident": true}
@@ -109,35 +129,41 @@ func headerData(header http.Header, referenced []string) map[string]any {
 	return out
 }
 
-// identHelper renders a value as a double-quoted SQL identifier, quoting
-// each dot-separated part. With allow="a,b,c" the value must be one of
-// the listed names, which is the recommended way to accept identifiers
-// such as sort columns from requests.
+// identHelper is the Handlebars form of quoteIdent: {{ident col allow="a,b"}}.
 func identHelper(v any, options *raymond.Options) raymond.SafeString {
+	var allow []string
+	if a := options.HashStr("allow"); a != "" {
+		for _, s := range strings.Split(a, ",") {
+			allow = append(allow, strings.TrimSpace(s))
+		}
+	}
+	quoted, err := quoteIdent(v, allow)
+	if err != nil {
+		panic(&inputError{err.Error()})
+	}
+	return raymond.SafeString(quoted)
+}
+
+// quoteIdent renders a value as a double-quoted SQL identifier, quoting
+// each dot-separated part. With an allow list the value must be one of the
+// listed names, which is the recommended way to accept identifiers such as
+// sort columns from requests.
+func quoteIdent(v any, allow []string) (string, error) {
 	name, ok := v.(string)
 	if !ok || name == "" {
-		panic(&inputError{fmt.Sprintf("ident: expected a non-empty string, got %v", v)})
+		return "", fmt.Errorf("ident: expected a non-empty string, got %v", v)
 	}
-	if allow := options.HashStr("allow"); allow != "" {
-		permitted := false
-		for _, a := range strings.Split(allow, ",") {
-			if strings.TrimSpace(a) == name {
-				permitted = true
-				break
-			}
-		}
-		if !permitted {
-			panic(&inputError{fmt.Sprintf("ident: %q is not one of %s", name, allow)})
-		}
+	if len(allow) > 0 && !slices.Contains(allow, name) {
+		return "", fmt.Errorf("ident: %q is not one of %s", name, strings.Join(allow, ","))
 	}
 	if strings.ContainsRune(name, 0) {
-		panic(&inputError{"ident: identifier contains a NUL byte"})
+		return "", errors.New("ident: identifier contains a NUL byte")
 	}
 	parts := strings.Split(name, ".")
 	for i, p := range parts {
 		parts[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
 	}
-	return raymond.SafeString(strings.Join(parts, "."))
+	return strings.Join(parts, "."), nil
 }
 
 // rewriteTemplate validates a template and inserts "bind " into each plain
@@ -343,7 +369,7 @@ func checkBoundPlaceholders(stmt *statement, bound map[string]any) error {
 	}
 	for name := range bound {
 		if !used[name] {
-			return errors.New("a {{value}} expression appears inside a quoted SQL string or comment, " +
+			return errors.New("a template value appears inside a quoted SQL string or comment, " +
 				"where it cannot be bound; build the string in SQL instead, e.g. '%' || {{q}} || '%'")
 		}
 	}
@@ -359,17 +385,17 @@ type templateCache struct {
 
 type templateCacheEntry struct {
 	src string
-	tpl *sqlTemplate
+	tpl queryTemplate
 	err error
 }
 
-func (c *templateCache) get(name, src string) (*sqlTemplate, error) {
+func (c *templateCache) get(name, src string) (queryTemplate, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[name]; ok && e.src == src {
 		return e.tpl, e.err
 	}
-	tpl, err := parseSQLTemplate(src)
+	tpl, err := parseQueryTemplate(name, src)
 	c.entries[name] = templateCacheEntry{src: src, tpl: tpl, err: err}
 	return tpl, err
 }
