@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,14 @@ type S3Config struct {
 type s3API interface {
 	GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadBucket(ctx context.Context, in *s3.HeadBucketInput, opts ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
+	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
+// s3Listing is a cached directory listing. Like s3Entry it is replaced,
+// never modified.
+type s3Listing struct {
+	entries   []dirEntry
+	fetchedAt time.Time
 }
 
 // s3Entry is a cached query file, or a cached miss. Entries are never
@@ -103,6 +112,10 @@ type s3Source struct {
 	lru   *list.List // of *s3Entry, most recently used first
 	items map[string]*list.Element
 	bytes int64
+	// Directory listings, used to resolve dynamic route segments. There is
+	// one per directory in the bucket that a request has reached, so they
+	// are not counted against maxBytes.
+	listings map[string]*s3Listing
 }
 
 // parseS3URL splits s3://bucket/some/prefix into bucket and "some/prefix/".
@@ -164,6 +177,7 @@ func newS3Source(client s3API, bucket, prefix string, cfg *S3Config, logger *zap
 		now:      time.Now,
 		lru:      list.New(),
 		items:    map[string]*list.Element{},
+		listings: map[string]*s3Listing{},
 	}
 }
 
@@ -186,6 +200,78 @@ func (s *s3Source) Get(_ context.Context, name string) (string, error) {
 		return "", err
 	}
 	return v.(*s3Entry).result()
+}
+
+// List returns the entries of a directory under the prefix. Listings are
+// cached for the TTL; if S3 fails while refreshing one, the stale listing
+// is served.
+func (s *s3Source) List(_ context.Context, dir string) ([]dirEntry, error) {
+	s.mu.Lock()
+	prev := s.listings[dir]
+	s.mu.Unlock()
+	if prev != nil && s.now().Sub(prev.fetchedAt) < s.ttl {
+		return prev.entries, nil
+	}
+	v, err, _ := s.group.Do("list:"+dir, func() (any, error) { return s.loadListing(dir, prev) })
+	if err != nil {
+		return nil, err
+	}
+	return v.(*s3Listing).entries, nil
+}
+
+func (s *s3Source) loadListing(dir string, prev *s3Listing) (*s3Listing, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+
+	prefix := s.prefix
+	if dir != "" {
+		prefix += dir + "/"
+	}
+	in := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(s.bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	}
+	var entries []dirEntry
+	for {
+		out, err := s.client.ListObjectsV2(ctx, in)
+		if err != nil {
+			if prev != nil {
+				s.logger.Warn("listing S3 directory failed; using cached listing",
+					zap.String("prefix", prefix), zap.Error(err))
+				l := &s3Listing{entries: prev.entries, fetchedAt: s.now()}
+				s.storeListing(dir, l)
+				return l, nil
+			}
+			return nil, fmt.Errorf("listing s3://%s/%s: %w", s.bucket, prefix, err)
+		}
+		for _, p := range out.CommonPrefixes {
+			if name := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(p.Prefix), prefix), "/"); name != "" && !strings.HasPrefix(name, ".") {
+				entries = append(entries, dirEntry{Name: name, IsDir: true})
+			}
+		}
+		for _, o := range out.Contents {
+			// Skip "folder" placeholder objects (keys ending in /).
+			if name := strings.TrimPrefix(aws.ToString(o.Key), prefix); name != "" && !strings.HasSuffix(name, "/") && !strings.HasPrefix(name, ".") {
+				entries = append(entries, dirEntry{Name: name})
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+			break
+		}
+		in.ContinuationToken = out.NextContinuationToken
+	}
+	slices.SortFunc(entries, func(a, b dirEntry) int { return strings.Compare(a.Name, b.Name) })
+
+	l := &s3Listing{entries: entries, fetchedAt: s.now()}
+	s.storeListing(dir, l)
+	return l, nil
+}
+
+func (s *s3Source) storeListing(dir string, l *s3Listing) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listings[dir] = l
 }
 
 func (s *s3Source) cached(name string) *s3Entry {

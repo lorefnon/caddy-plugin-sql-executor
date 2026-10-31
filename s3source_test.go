@@ -5,10 +5,12 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"html"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,11 +34,12 @@ type fakeS3 struct {
 	misses   map[string]int // 404 responses
 	failAll  bool
 	getDelay time.Duration
+	lists    map[string]int // ListObjectsV2 requests by prefix
 }
 
 func newFakeS3(bucket string, objects map[string]string) *fakeS3 {
 	return &fakeS3{bucket: bucket, objects: objects,
-		gets: map[string]int{}, notMods: map[string]int{}, misses: map[string]int{}}
+		gets: map[string]int{}, notMods: map[string]int{}, misses: map[string]int{}, lists: map[string]int{}}
 }
 
 func etagOf(body string) string {
@@ -101,6 +104,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if key == "" && r.Method == http.MethodHead {
 		return // HeadBucket
 	}
+	if key == "" && r.URL.Query().Get("list-type") == "2" {
+		f.list(w, r.URL.Query().Get("prefix"), r.URL.Query().Get("delimiter"))
+		return
+	}
 	body, ok := f.objects[key]
 	if !ok {
 		f.misses[key]++
@@ -119,6 +126,48 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.gets[key]++
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Write([]byte(body))
+}
+
+// list answers ListObjectsV2 with the keys under prefix, grouping those
+// below the delimiter into common prefixes. The caller holds f.mu.
+func (f *fakeS3) list(w http.ResponseWriter, prefix, delimiter string) {
+	f.lists[prefix]++
+	var keys, prefixes []string
+	seen := map[string]bool{}
+	for key := range f.objects {
+		rest, ok := strings.CutPrefix(key, prefix)
+		if !ok {
+			continue
+		}
+		if i := strings.Index(rest, delimiter); delimiter != "" && i >= 0 {
+			if p := prefix + rest[:i+len(delimiter)]; !seen[p] {
+				seen[p] = true
+				prefixes = append(prefixes, p)
+			}
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	sort.Strings(prefixes)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated>`)
+	for _, k := range keys {
+		b.WriteString("<Contents><Key>" + html.EscapeString(k) + "</Key></Contents>")
+	}
+	for _, p := range prefixes {
+		b.WriteString("<CommonPrefixes><Prefix>" + html.EscapeString(p) + "</Prefix></CommonPrefixes>")
+	}
+	b.WriteString("</ListBucketResult>")
+	w.Header().Set("Content-Type", "application/xml")
+	w.Write([]byte(b.String()))
+}
+
+// listRequests reports how many listings a prefix has received.
+func (f *fakeS3) listRequests(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lists[prefix]
 }
 
 // testClock is a manually advanced clock for TTL tests.
@@ -389,4 +438,75 @@ func TestS3ProvisionWhileUnavailable(t *testing.T) {
 	fake := newFakeS3("b", map[string]string{})
 	fake.failAll = true
 	newS3Handler(t, fake, "s3://b", S3Config{}) // fails the test on error
+}
+
+func TestS3SourceDynamicRoutes(t *testing.T) {
+	fake := newFakeS3("b", map[string]string{
+		"q/users/[id].sql":      "SELECT :id AS id",
+		"q/users/me.sql":        "SELECT 'me' AS id",
+		"q/docs/[...slug].sql":  "SELECT :slug AS slug",
+		"q/items/[id]/GET.sql":  "SELECT :id AS id",
+		"q/items/[id]/":         "x", // folder placeholder, not an entry
+		"other/users/[id].sql":  "SELECT 'wrong prefix'",
+		"q/users/.hidden/x.sql": "SELECT 1",
+	})
+	h, clock := newS3Handler(t, fake, "s3://b/q", S3Config{CacheTTL: caddy.Duration(time.Minute)})
+
+	res := serve(t, h, "POST", "/users/42", "", nil)
+	if res.status != 200 || res.body != `[{"id":"42"}]`+"\n" {
+		t.Errorf("dynamic file: status %d body %q", res.status, res.body)
+	}
+	res = serve(t, h, "POST", "/docs/a/b", "", nil)
+	if res.status != 200 || res.body != `[{"slug":"[\"a\",\"b\"]"}]`+"\n" {
+		t.Errorf("catch-all: status %d body %q", res.status, res.body)
+	}
+	if res := serve(t, h, "POST", "/nothing/here", "", nil); res.nextCalls != 1 {
+		t.Errorf("unknown route: status %d", res.status)
+	}
+
+	// Listings are cached: repeated requests don't list again.
+	listed := fake.listRequests("q/users/")
+	for range 3 {
+		serve(t, h, "POST", "/users/43", "", nil)
+	}
+	if got := fake.listRequests("q/users/"); got != listed {
+		t.Errorf("listings of q/users/: %d, want %d", got, listed)
+	}
+
+	// ...until the TTL passes, and then a new file shows up.
+	fake.set("q/users/[name]/orders.sql", "SELECT :name AS name")
+	clock.advance(2 * time.Minute)
+	res = serve(t, h, "POST", "/users/zed/orders", "", nil)
+	if res.status != 200 || res.body != `[{"name":"zed"}]`+"\n" {
+		t.Errorf("new file after TTL: status %d body %q", res.status, res.body)
+	}
+
+	// A failing S3 doesn't take down routes that were listed before.
+	fake.setFailing(true)
+	clock.advance(2 * time.Minute)
+	res = serve(t, h, "POST", "/users/42", "", nil)
+	if res.status != 200 || res.body != `[{"id":"42"}]`+"\n" {
+		t.Errorf("stale listing during outage: status %d body %q", res.status, res.body)
+	}
+}
+
+func TestS3SourceVerbNamedFiles(t *testing.T) {
+	fake := newFakeS3("b", map[string]string{
+		"items/GET.sql":         "SELECT 'list' AS op",
+		"items/[id]/DELETE.sql": "SELECT 'delete' AS op, :id AS id",
+	})
+	h, _ := newS3Handler(t, fake, "s3://b/", S3Config{})
+	h.VerbNamedFiles = true
+
+	res := serve(t, h, "DELETE", "/items/9", "", nil)
+	if res.status != 200 || res.body != `[{"op":"delete","id":"9"}]`+"\n" {
+		t.Errorf("DELETE: status %d body %q", res.status, res.body)
+	}
+	res = serve(t, h, "GET", "/items", "", nil)
+	if res.status != 200 || res.body != `[{"op":"list"}]`+"\n" {
+		t.Errorf("GET: status %d body %q", res.status, res.body)
+	}
+	if res := serve(t, h, "GET", "/items/9", "", nil); res.nextCalls != 1 {
+		t.Errorf("GET without a file: status %d", res.status)
+	}
 }

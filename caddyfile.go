@@ -29,11 +29,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    dsn            <data source name>
 //	    timeout        <duration>
 //	    max_body_size  <size>
-//	    default_format json | csv | yaml | xlsx
+//	    formats        json | csv | yaml | xlsx | html ...
+//	    default_format json | csv | yaml | xlsx | html
 //	    max_open_conns <n>
 //	    max_idle_conns <n>
 //	    verbose_errors
 //	    jinja_includes
+//	    verb_named_files
 //	    s3 {
 //	        region            <region>
 //	        endpoint          <url>
@@ -65,6 +67,11 @@ func (h *SQLExecutor) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "dsn":
 			if err := singleArg(d, &h.DSN); err != nil {
 				return err
+			}
+		case "formats":
+			h.Formats = d.RemainingArgs()
+			if len(h.Formats) == 0 {
+				return d.ArgErr()
 			}
 		case "default_format":
 			if err := singleArg(d, &h.DefaultFormat); err != nil {
@@ -102,6 +109,11 @@ func (h *SQLExecutor) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			h.JinjaIncludes = true
+		case "verb_named_files":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			h.VerbNamedFiles = true
 		case "s3":
 			if d.NextArg() {
 				return d.ArgErr()

@@ -19,6 +19,7 @@ type generator struct {
 	compiler *sqlexecutor.Compiler
 	desc     describer
 	used     map[string]bool
+	ids      map[string]bool
 }
 
 // fileError is a failure to describe one query file.
@@ -32,7 +33,7 @@ func (e *fileError) Error() string { return e.File + ": " + e.Err.Error() }
 // generate returns the document, plus an error for each file that could
 // not be described. Those files are left out of the document.
 func (g *generator) generate(ctx context.Context) (*document, []error, error) {
-	files, err := sqlexecutor.ListQueryFiles(g.cfg.Root)
+	files, err := sqlexecutor.ListQueryFiles(g.cfg.Root, g.cfg.VerbNamedFiles)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -55,19 +56,98 @@ func (g *generator) generate(ctx context.Context) (*document, []error, error) {
 
 	var errs []error
 	g.used = map[string]bool{}
+	g.ids = map[string]bool{}
 	for _, f := range files {
-		op, row, err := g.operation(ctx, f)
-		if err != nil {
+		if err := g.add(ctx, doc, f); err != nil {
 			errs = append(errs, &fileError{f.File, err})
-			continue
 		}
-		doc.Paths["/"+f.Route] = &pathItem{Post: op}
-		doc.Components.Schemas[rowSchemaName(op.OperationID)] = row
 	}
 	for _, key := range g.cfg.unused(g.used) {
 		errs = append(errs, fmt.Errorf("queries: %s matches no query file", key))
 	}
 	return doc, errs, nil
+}
+
+// add describes a query file and adds its operations to doc.
+func (g *generator) add(ctx context.Context, doc *document, f sqlexecutor.QueryFile) error {
+	segs := f.Segments()
+	for i, s := range segs {
+		if (s.Kind == sqlexecutor.CatchAllSegment || s.Kind == sqlexecutor.OptionalCatchAllSegment) && i < len(segs)-1 {
+			return fmt.Errorf("the handler never serves this route: [...%s] must be its last segment", s.Name)
+		}
+	}
+	if !(&pathItem{}).set(f.Method, nil) {
+		return fmt.Errorf("OpenAPI 3.1 has no operation for the %s method", f.Method)
+	}
+
+	id := g.operationID(f)
+	op, row, err := g.operation(ctx, f, id)
+	if err != nil {
+		return err
+	}
+	doc.Components.Schemas[rowSchemaName(id)] = row
+
+	g.pathItem(doc, "/"+openAPIPath(segs)).set(f.Method, op)
+	// [[...x]] also matches the path without it, where x is an empty list.
+	if last := segs[len(segs)-1]; last.Kind == sqlexecutor.OptionalCatchAllSegment {
+		base := *op
+		base.OperationID = g.uniqueID(id + "_none")
+		base.Parameters = slices.DeleteFunc(slices.Clone(op.Parameters), func(p parameter) bool {
+			return p.In == "path" && p.Name == last.Name
+		})
+		g.pathItem(doc, "/"+openAPIPath(segs[:len(segs)-1])).set(f.Method, &base)
+	}
+	return nil
+}
+
+func (g *generator) pathItem(doc *document, path string) *pathItem {
+	item := doc.Paths[path]
+	if item == nil {
+		item = &pathItem{}
+		doc.Paths[path] = item
+	}
+	return item
+}
+
+// openAPIPath writes route segments as an OpenAPI path: users/[id] becomes
+// users/{id}.
+func openAPIPath(segs []sqlexecutor.Segment) string {
+	parts := make([]string, len(segs))
+	for i, s := range segs {
+		parts[i] = s.Name
+		if s.Kind != sqlexecutor.StaticSegment {
+			parts[i] = "{" + s.Name + "}"
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// operationID names a file's operation after its route, and after its
+// method when routing is by method: users/[id] becomes users_id, and
+// DELETE on it users_id_delete.
+func (g *generator) operationID(f sqlexecutor.QueryFile) string {
+	segs := f.Segments()
+	names := make([]string, len(segs))
+	for i, s := range segs {
+		names[i] = s.Name
+	}
+	id := operationID(strings.Join(names, "/"))
+	if g.cfg.VerbNamedFiles {
+		id += "_" + strings.ToLower(f.Method)
+	}
+	return g.uniqueID(id)
+}
+
+// uniqueID returns id, or id with a number appended if it is taken, since
+// two routes such as users/[id] and users/id would get the same one.
+func (g *generator) uniqueID(id string) string {
+	for n, candidate := 2, id; ; n++ {
+		if !g.ids[candidate] {
+			g.ids[candidate] = true
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s_%d", id, n)
+	}
 }
 
 // variant is one way of running a query file: the file itself, or a
@@ -79,7 +159,7 @@ type variant struct {
 	notes  *annotations
 }
 
-func (g *generator) operation(ctx context.Context, f sqlexecutor.QueryFile) (*operation, *Schema, error) {
+func (g *generator) operation(ctx context.Context, f sqlexecutor.QueryFile, id string) (*operation, *Schema, error) {
 	qc := g.cfg.query(f.File, f.Route, g.used)
 	src, err := g.compiler.Source(ctx, f.File)
 	if err != nil {
@@ -110,7 +190,6 @@ func (g *generator) operation(ctx context.Context, f sqlexecutor.QueryFile) (*op
 	if err != nil {
 		return nil, nil, err
 	}
-	id := operationID(f.Route)
 	op := &operation{
 		OperationID: id,
 		Description: desc,
@@ -133,7 +212,17 @@ func (g *generator) operation(ctx context.Context, f sqlexecutor.QueryFile) (*op
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(body.Properties) > 0 || (f.Template && len(variants) == 0) {
+	body, pathParams := splitPathParams(f, body)
+	op.Parameters = pathParams
+	if bodyless(f.Method) {
+		// The handler reads the query string for every method. Methods
+		// whose requests carry no body get their parameters there.
+		for _, p := range body.Properties {
+			op.Parameters = append(op.Parameters, parameter{
+				Name: p.Name, In: "query", Required: slices.Contains(body.Required, p.Name), Schema: textSchema(p.Schema),
+			})
+		}
+	} else if len(body.Properties) > 0 || (f.Template && len(variants) == 0) {
 		op.RequestBody = &requestBody{
 			Required: len(body.Required) > 0,
 			Content: map[string]mediaType{
@@ -142,8 +231,69 @@ func (g *generator) operation(ctx context.Context, f sqlexecutor.QueryFile) (*op
 			},
 		}
 	}
-	op.Parameters = headers
+	op.Parameters = append(op.Parameters, headers...)
 	return op, row, nil
+}
+
+// bodyless reports whether OpenAPI advises against a request body for
+// the method.
+func bodyless(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete ||
+		method == http.MethodOptions || method == http.MethodTrace
+}
+
+// splitPathParams moves the parameters captured from the path, such as id
+// for users/[id], out of the request body schema and into path parameters.
+// The path supplies these, so they are never in the body, and are always
+// required.
+func splitPathParams(f sqlexecutor.QueryFile, body *Schema) (*Schema, []parameter) {
+	var params []parameter
+	rest := *body
+	rest.Properties = slices.Clone(body.Properties)
+	rest.Required = slices.Clone(body.Required)
+	for _, seg := range f.Segments() {
+		if seg.Kind == sqlexecutor.StaticSegment {
+			continue
+		}
+		p := parameter{Name: seg.Name, In: "path", Required: true}
+		if seg.Kind == sqlexecutor.ParamSegment {
+			s, _ := body.Properties.get(seg.Name)
+			p.Schema = textSchema(s)
+		} else {
+			p.Schema = typed("string", "")
+			p.Description = "Path segments separated by /. The query receives them as a JSON array."
+		}
+		params = append(params, p)
+		rest.Properties = slices.DeleteFunc(rest.Properties, func(pr Property) bool { return pr.Name == seg.Name })
+		rest.Required = slices.DeleteFunc(rest.Required, func(n string) bool { return n == seg.Name })
+	}
+	return &rest, params
+}
+
+// textSchema describes a value sent as text, in the path or query string:
+// it can't be null or structured. Where it is, the value is described as
+// the string the handler is given. Unknown types are strings.
+func textSchema(s *Schema) *Schema {
+	if s == nil {
+		return typed("string", "")
+	}
+	ts := s.types()
+	if len(ts) == 0 {
+		return typed("string", "")
+	}
+	if slices.Contains(ts, "array") || slices.Contains(ts, "object") {
+		return &Schema{Type: "string", Description: "JSON text."}
+	}
+	if !slices.Contains(ts, "null") {
+		return s
+	}
+	c := *s
+	c.setTypes(withoutNull(ts))
+	c.Enum = slices.DeleteFunc(slices.Clone(s.Enum), func(v any) bool { return v == nil })
+	if len(c.Enum) == 0 {
+		c.Enum = nil
+	}
+	return &c
 }
 
 // variant compiles and describes a query file, rendered with sample if it

@@ -32,9 +32,12 @@ type config struct {
 	PostgresVersion string `yaml:"postgres_version"`
 	// JinjaIncludes matches the handler's jinja_includes option.
 	JinjaIncludes bool `yaml:"jinja_includes"`
+	// VerbNamedFiles matches the handler's verb_named_files option.
+	VerbNamedFiles bool `yaml:"verb_named_files"`
 
 	// Queries holds per-file settings, keyed by file (products/search.sql.j2)
-	// or by route (products/search).
+	// or by route (products/search). With VerbNamedFiles a route such as
+	// items/[id] covers the files for all of its methods.
 	Queries map[string]*queryConfig `yaml:"queries"`
 }
 

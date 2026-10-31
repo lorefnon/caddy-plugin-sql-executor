@@ -1,9 +1,11 @@
 package sqlexecutor
 
 import (
+	"cmp"
 	"context"
 	"io/fs"
 	"net/http"
+	"path"
 	"slices"
 	"strings"
 )
@@ -21,17 +23,48 @@ type QueryFile struct {
 	File string
 	// Template reports whether File is a Jinja template (.sql.j2).
 	Template bool
+	// Method is the HTTP method that runs the file: POST, or with verb
+	// named files the file's name, e.g. DELETE for items/[id]/DELETE.sql.
+	Method string
+}
+
+// Segment is one path segment of a route.
+type Segment struct {
+	Kind SegmentKind
+	// Name is the text of a static segment, or the parameter a dynamic
+	// segment is bound to.
+	Name string
+}
+
+// Segments splits the route into path segments, recognising dynamic ones
+// such as [id].
+func (f QueryFile) Segments() []Segment {
+	parts := strings.Split(f.Route, "/")
+	segs := make([]Segment, len(parts))
+	for i, p := range parts {
+		kind, param := parseSegment(p)
+		if kind == StaticSegment {
+			param = p
+		}
+		segs[i] = Segment{kind, param}
+	}
+	return segs
 }
 
 // ListQueryFiles returns the routes served from a local query root, sorted
-// by route. Where both name.sql and name.sql.j2 exist, the handler serves
-// name.sql, and so only it is listed.
-func ListQueryFiles(root string) ([]QueryFile, error) {
+// by route and then method. Where both name.sql and name.sql.j2 exist, the
+// handler serves name.sql, and so only it is listed.
+//
+// verbNamedFiles corresponds to the handler's verb_named_files option: a
+// route is then the directory of a file named for a method, such as
+// items/DELETE.sql, and other files are not routes.
+func ListQueryFiles(root string, verbNamedFiles bool) ([]QueryFile, error) {
 	src, err := newDirSource(root)
 	if err != nil {
 		return nil, err
 	}
-	routes := map[string]QueryFile{}
+	type key struct{ route, method string }
+	routes := map[key]QueryFile{}
 	err = fs.WalkDir(src.fsys, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -53,8 +86,18 @@ func ListQueryFiles(root string) ([]QueryFile, error) {
 				return nil
 			}
 		}
-		if prev, dup := routes[f.Route]; !dup || prev.Template {
-			routes[f.Route] = f
+		f.Method = http.MethodPost
+		if verbNamedFiles {
+			dir, verb := path.Split(f.Route)
+			if dir == "" || !validVerb(verb) {
+				// Not a route. A file in the root has no directory to name.
+				return nil
+			}
+			f.Route, f.Method = strings.TrimSuffix(dir, "/"), verb
+		}
+		k := key{f.Route, f.Method}
+		if prev, dup := routes[k]; !dup || prev.Template {
+			routes[k] = f
 		}
 		return nil
 	})
@@ -65,7 +108,9 @@ func ListQueryFiles(root string) ([]QueryFile, error) {
 	for _, f := range routes {
 		files = append(files, f)
 	}
-	slices.SortFunc(files, func(a, b QueryFile) int { return strings.Compare(a.Route, b.Route) })
+	slices.SortFunc(files, func(a, b QueryFile) int {
+		return cmp.Or(strings.Compare(a.Route, b.Route), strings.Compare(a.Method, b.Method))
+	})
 	return files, nil
 }
 

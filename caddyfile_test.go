@@ -19,11 +19,13 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		dsn {env.DATABASE_URL}
 		timeout 15s
 		max_body_size 2MiB
+		formats csv json html
 		default_format csv
 		max_open_conns 20
 		max_idle_conns 5
 		verbose_errors
 		jinja_includes
+		verb_named_files
 		s3 {
 			region eu-west-1
 			endpoint http://localhost:9000
@@ -40,16 +42,18 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := SQLExecutor{
-		Root:          "s3://my-bucket/queries",
-		Driver:        "postgres",
-		DSN:           "{env.DATABASE_URL}",
-		Timeout:       caddy.Duration(15 * time.Second),
-		MaxBodySize:   2 << 20,
-		DefaultFormat: "csv",
-		MaxOpenConns:  20,
-		MaxIdleConns:  5,
-		VerboseErrors: true,
-		JinjaIncludes: true,
+		Root:           "s3://my-bucket/queries",
+		Driver:         "postgres",
+		DSN:            "{env.DATABASE_URL}",
+		Timeout:        caddy.Duration(15 * time.Second),
+		MaxBodySize:    2 << 20,
+		Formats:        []string{"csv", "json", "html"},
+		DefaultFormat:  "csv",
+		MaxOpenConns:   20,
+		MaxIdleConns:   5,
+		VerboseErrors:  true,
+		JinjaIncludes:  true,
+		VerbNamedFiles: true,
 		S3: &S3Config{
 			Region:          "eu-west-1",
 			Endpoint:        "http://localhost:9000",
@@ -77,6 +81,7 @@ func TestUnmarshalCaddyfileErrors(t *testing.T) {
 		"sql_executor {\nmax_open_conns -1\n}",
 		"sql_executor {\nverbose_errors yes\n}",
 		"sql_executor {\njinja_includes on\n}",
+		"sql_executor {\nverb_named_files on\n}",
 		"sql_executor {\ns3 x {\n}\n}",
 		"sql_executor {\ns3 {\nbogus\n}\n}",
 		"sql_executor {\ns3 {\nuse_path_style no\n}\n}",

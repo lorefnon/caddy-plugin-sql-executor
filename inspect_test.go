@@ -19,18 +19,57 @@ func TestListQueryFiles(t *testing.T) {
 		"notes.txt":         "not a query",
 		"dir.sql/inner.sql": "SELECT 7",
 	})
-	got, err := ListQueryFiles(dir)
+	got, err := ListQueryFiles(dir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []QueryFile{
-		{Route: "a", File: "a.sql"},
-		{Route: "b", File: "b.sql.j2", Template: true},
-		{Route: "dir.sql/inner", File: "dir.sql/inner.sql"},
-		{Route: "reports/c", File: "reports/c.sql"},
+		{Route: "a", File: "a.sql", Method: "POST"},
+		{Route: "b", File: "b.sql.j2", Template: true, Method: "POST"},
+		{Route: "dir.sql/inner", File: "dir.sql/inner.sql", Method: "POST"},
+		{Route: "reports/c", File: "reports/c.sql", Method: "POST"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestListQueryFilesVerbNamed(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		"GET.sql":                 "SELECT 0",
+		"plain.sql":               "SELECT 1",
+		"items/GET.sql":           "SELECT 2",
+		"items/GET.sql.j2":        "SELECT 3",
+		"items/POST.sql.j2":       "SELECT 4",
+		"items/[id]/DELETE.sql":   "SELECT 5",
+		"items/[id]/notaverb.sql": "SELECT 6",
+		"files/[...p]/GET.sql":    "SELECT 7",
+	})
+	got, err := ListQueryFiles(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []QueryFile{
+		{Route: "files/[...p]", File: "files/[...p]/GET.sql", Method: "GET"},
+		{Route: "items", File: "items/GET.sql", Method: "GET"},
+		{Route: "items", File: "items/POST.sql.j2", Template: true, Method: "POST"},
+		{Route: "items/[id]", File: "items/[id]/DELETE.sql", Method: "DELETE"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestQueryFileSegments(t *testing.T) {
+	got := QueryFile{Route: "a/[id]/[...rest]"}.Segments()
+	want := []Segment{{StaticSegment, "a"}, {ParamSegment, "id"}, {CatchAllSegment, "rest"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	got = QueryFile{Route: "[[...x]]"}.Segments()
+	if want := []Segment{{OptionalCatchAllSegment, "x"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
 

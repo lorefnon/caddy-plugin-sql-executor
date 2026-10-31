@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"strings"
 )
 
@@ -12,6 +13,16 @@ import (
 // Get returns an error wrapping fs.ErrNotExist when there is no such file.
 type source interface {
 	Get(ctx context.Context, name string) (string, error)
+	// List returns the visible entries of a directory ("" is the root),
+	// sorted by name. It returns an error wrapping fs.ErrNotExist when
+	// there is no such directory.
+	List(ctx context.Context, dir string) ([]dirEntry, error)
+}
+
+// dirEntry is a file or subdirectory found by source.List.
+type dirEntry struct {
+	Name  string
+	IsDir bool
 }
 
 // dirSource reads queries from a local directory on every request, so
@@ -44,6 +55,33 @@ func (d *dirSource) Get(_ context.Context, name string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func (d *dirSource) List(_ context.Context, dir string) ([]dirEntry, error) {
+	if dir == "" {
+		dir = "."
+	}
+	if !fs.ValidPath(dir) {
+		return nil, fs.ErrNotExist
+	}
+	des, err := fs.ReadDir(d.fsys, dir)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]dirEntry, 0, len(des))
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), ".") {
+			continue
+		}
+		isDir := de.IsDir()
+		if de.Type()&fs.ModeSymlink != 0 {
+			if info, err := fs.Stat(d.fsys, path.Join(dir, de.Name())); err == nil {
+				isDir = info.IsDir()
+			}
+		}
+		entries = append(entries, dirEntry{Name: de.Name(), IsDir: isDir})
+	}
+	return entries, nil
 }
 
 // validQueryFile accepts the names of query files and of Jinja templates

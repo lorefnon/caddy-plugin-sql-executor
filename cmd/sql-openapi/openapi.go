@@ -30,8 +30,31 @@ type server struct {
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 }
 
+// pathItem holds a path's operations, one per HTTP method OpenAPI 3.1 has
+// a field for.
 type pathItem struct {
-	Post *operation `json:"post" yaml:"post"`
+	Get     *operation `json:"get,omitempty" yaml:"get,omitempty"`
+	Put     *operation `json:"put,omitempty" yaml:"put,omitempty"`
+	Post    *operation `json:"post,omitempty" yaml:"post,omitempty"`
+	Delete  *operation `json:"delete,omitempty" yaml:"delete,omitempty"`
+	Options *operation `json:"options,omitempty" yaml:"options,omitempty"`
+	Head    *operation `json:"head,omitempty" yaml:"head,omitempty"`
+	Patch   *operation `json:"patch,omitempty" yaml:"patch,omitempty"`
+	Trace   *operation `json:"trace,omitempty" yaml:"trace,omitempty"`
+}
+
+// set stores op as the operation for an upper case HTTP method. It reports
+// false if OpenAPI 3.1 has no operation for the method.
+func (p *pathItem) set(method string, op *operation) bool {
+	slot := map[string]**operation{
+		"GET": &p.Get, "PUT": &p.Put, "POST": &p.Post, "DELETE": &p.Delete,
+		"OPTIONS": &p.Options, "HEAD": &p.Head, "PATCH": &p.Patch, "TRACE": &p.Trace,
+	}[method]
+	if slot == nil {
+		return false
+	}
+	*slot = op
+	return true
 }
 
 type operation struct {

@@ -1,6 +1,7 @@
 package sqlexecutor
 
 import (
+	"fmt"
 	"path"
 	"sort"
 	"strconv"
@@ -15,22 +16,53 @@ const (
 	formatCSV  format = "csv"
 	formatYAML format = "yaml"
 	formatXLSX format = "xlsx"
+	formatHTML format = "html"
 )
+
+// allFormats lists every format in the order used for messages and as the
+// default when no formats are configured.
+var allFormats = []format{formatJSON, formatCSV, formatYAML, formatXLSX, formatHTML}
+
+// formatSet is a set of enabled formats. A nil set enables every format.
+type formatSet map[format]bool
+
+func (s formatSet) has(f format) bool { return s == nil || s[f] }
+
+// mediaTypes returns the primary media type of each enabled format.
+func (s formatSet) mediaTypes() []string {
+	var out []string
+	for _, f := range allFormats {
+		if s.has(f) {
+			out = append(out, f.mediaType())
+		}
+	}
+	return out
+}
 
 const xlsxMediaType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-// contentType returns the Content-Type header value for the format.
-func (f format) contentType() string {
+// mediaType returns the format's media type without parameters.
+func (f format) mediaType() string {
 	switch f {
 	case formatCSV:
-		return "text/csv; charset=utf-8"
+		return "text/csv"
 	case formatYAML:
-		return "application/yaml; charset=utf-8"
+		return "application/yaml"
 	case formatXLSX:
 		return xlsxMediaType
+	case formatHTML:
+		return "text/html"
 	default:
-		return "application/json; charset=utf-8"
+		return "application/json"
 	}
+}
+
+// contentType returns the Content-Type header value for the format.
+func (f format) contentType() string {
+	if f == formatXLSX {
+		return xlsxMediaType
+	}
+	return f.mediaType() + "; charset=utf-8"
 }
 
 var formatsByExt = map[string]format{
@@ -39,6 +71,8 @@ var formatsByExt = map[string]format{
 	".yaml": formatYAML,
 	".yml":  formatYAML,
 	".xlsx": formatXLSX,
+	".html": formatHTML,
+	".htm":  formatHTML,
 }
 
 var formatsByMediaType = map[string]format{
@@ -51,6 +85,7 @@ var formatsByMediaType = map[string]format{
 	"text/yaml":          formatYAML,
 	"text/x-yaml":        formatYAML,
 	xlsxMediaType:        formatXLSX,
+	"text/html":          formatHTML,
 }
 
 func parseFormat(s string) (format, bool) {
@@ -58,10 +93,41 @@ func parseFormat(s string) (format, bool) {
 	return f, ok
 }
 
+// parseFormats turns configured format names into a set. It returns the
+// first name listed too, which becomes the default when json is excluded.
+// An empty list enables every format.
+func parseFormats(names []string) (set formatSet, first format, err error) {
+	if len(names) == 0 {
+		return nil, formatJSON, nil
+	}
+	set = formatSet{}
+	for i, n := range names {
+		f, ok := parseFormat(n)
+		if !ok {
+			return nil, "", fmt.Errorf("unknown format %q: use json, csv, yaml, xlsx or html", n)
+		}
+		if i == 0 {
+			first = f
+		}
+		set[f] = true
+	}
+	return set, first, nil
+}
+
 // resolveRoute maps a request path to the SQL file that backs it and the
 // format implied by the path's extension, if any. For example
 // "/reports/sales.csv" maps to "reports/sales.sql" with CSV output.
 func resolveRoute(urlPath string) (file string, f format, ok bool) {
+	route, f, ok := routeOf(urlPath)
+	if !ok {
+		return "", "", false
+	}
+	return route + ".sql", f, true
+}
+
+// routeOf is like resolveRoute, but returns the route without the .sql
+// suffix: "reports/sales" for "/reports/sales.csv".
+func routeOf(urlPath string) (route string, f format, ok bool) {
 	p := path.Clean("/" + urlPath)
 	if p == "/" || strings.HasSuffix(urlPath, "/") {
 		return "", "", false
@@ -76,13 +142,14 @@ func resolveRoute(urlPath string) (file string, f format, ok bool) {
 	if p == "" {
 		return "", "", false
 	}
-	return p + ".sql", f, true
+	return p, f, true
 }
 
-// negotiate picks a format from an Accept header. It returns ok=false when
-// the header only lists media types that cannot be produced, and an empty
-// format when any type is acceptable.
-func negotiate(accept string) (f format, ok bool) {
+// negotiate picks a format from an Accept header, considering only the
+// formats in allowed. It returns ok=false when the header only lists media
+// types that cannot be produced, and an empty format when any type is
+// acceptable.
+func negotiate(accept string, allowed formatSet) (f format, ok bool) {
 	accept = strings.TrimSpace(accept)
 	if accept == "" {
 		return "", true
@@ -111,14 +178,22 @@ func negotiate(accept string) (f format, ok bool) {
 		}
 		switch {
 		case mt == "*/*" || mt == "application/*" || mt == "text/*":
-			// text/* is satisfied by CSV; application/* and */* by the default.
+			// text/* is satisfied by CSV, or HTML when CSV is off;
+			// application/* and */* by the default.
 			c := candidate{wildcard: true, q: q, order: i}
 			if mt == "text/*" {
-				c = candidate{f: formatCSV, q: q, order: i}
+				switch {
+				case allowed.has(formatCSV):
+					c = candidate{f: formatCSV, q: q, order: i}
+				case allowed.has(formatHTML):
+					c = candidate{f: formatHTML, q: q, order: i}
+				default:
+					continue
+				}
 			}
 			cands = append(cands, c)
 		default:
-			if mf, known := formatsByMediaType[mt]; known {
+			if mf, known := formatsByMediaType[mt]; known && allowed.has(mf) {
 				cands = append(cands, candidate{f: mf, q: q, order: i})
 			}
 		}

@@ -91,14 +91,19 @@ type encoder interface {
 	End() error
 }
 
-func newEncoder(f format, w io.Writer, sheetName string) encoder {
+// newEncoder returns an encoder for f. name identifies the query (it names
+// the XLSX sheet and titles the HTML page) and query is the SQL that was
+// run, shown by the HTML format.
+func newEncoder(f format, w io.Writer, name, query string) encoder {
 	switch f {
 	case formatCSV:
 		return &csvEncoder{w: csv.NewWriter(w)}
 	case formatYAML:
 		return &yamlEncoder{w: w}
 	case formatXLSX:
-		return &xlsxEncoder{w: w, sheet: sheetName}
+		return &xlsxEncoder{w: w, sheet: name}
+	case formatHTML:
+		return &htmlEncoder{w: bufio.NewWriter(w), title: htmlTitle(name), query: query}
 	default:
 		return &jsonEncoder{w: bufio.NewWriter(w)}
 	}

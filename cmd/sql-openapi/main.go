@@ -52,6 +52,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	dsn := fl.String("dsn", "", "describe statements against this database")
 	schema := fl.String("schema", "", "describe statements against a throwaway database created from this DDL `file`")
 	jinjaIncludes := fl.Bool("jinja-includes", false, "allow include/import/extends/macro in templates, as the handler's jinja_includes")
+	verbNamedFiles := fl.Bool("verb-named-files", false, "route by HTTP method, as the handler's verb_named_files: DELETE /a/b is a/b/DELETE.sql")
 	out := fl.String("out", "", "write the spec to this `file` (.json or .yaml); default: YAML on stdout")
 	if err := fl.Parse(args); err != nil {
 		return err
@@ -76,6 +77,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			cfg.Schema = *schema
 		case "jinja-includes":
 			cfg.JinjaIncludes = *jinjaIncludes
+		case "verb-named-files":
+			cfg.VerbNamedFiles = *verbNamedFiles
 		}
 	})
 	cfg.DSN = os.ExpandEnv(cfg.DSN)

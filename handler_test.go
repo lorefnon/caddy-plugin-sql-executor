@@ -29,6 +29,7 @@ ORDER BY id`,
 VALUES (:name, :score, 1, '2024-03-01T00:00:00Z')
 RETURNING id, name`,
 	"empty.sql":        "SELECT id, name FROM users WHERE 0",
+	"markup.sql":       `SELECT '<script>alert(1)</script>' AS "<b>col</b>", NULL AS missing`,
 	"broken.sql":       "SELECT * FROM no_such_table",
 	"unterminated.sql": "SELECT 'oops",
 	"slow.sql":         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c",
@@ -307,7 +308,7 @@ func TestHandlerRouting(t *testing.T) {
 		t.Errorf("GET: status %d allow %q", res.status, res.header.Get("Allow"))
 	}
 
-	res = serve(t, h, "POST", "/users", `{"min_score":0}`, map[string]string{"Accept": "text/html"})
+	res = serve(t, h, "POST", "/users", `{"min_score":0}`, map[string]string{"Accept": "image/png"})
 	if res.status != 406 {
 		t.Errorf("unsupported Accept: status %d", res.status)
 	}
@@ -371,12 +372,14 @@ func TestHandlerPicksUpFileChanges(t *testing.T) {
 func TestProvisionErrors(t *testing.T) {
 	dir := t.TempDir()
 	tests := map[string]SQLExecutor{
-		"missing root": {Driver: "sqlite", DSN: "file::memory:"},
-		"missing dir":  {Root: filepath.Join(dir, "nope"), Driver: "sqlite", DSN: "file::memory:"},
-		"bad driver":   {Root: dir, Driver: "oracle", DSN: "x"},
-		"missing dsn":  {Root: dir, Driver: "sqlite"},
-		"bad format":   {Root: dir, Driver: "sqlite", DSN: "file::memory:", DefaultFormat: "xml"},
-		"bad s3 url":   {Root: "s3:///prefix", Driver: "sqlite", DSN: "file::memory:"},
+		"missing root":     {Driver: "sqlite", DSN: "file::memory:"},
+		"missing dir":      {Root: filepath.Join(dir, "nope"), Driver: "sqlite", DSN: "file::memory:"},
+		"bad driver":       {Root: dir, Driver: "oracle", DSN: "x"},
+		"missing dsn":      {Root: dir, Driver: "sqlite"},
+		"bad format":       {Root: dir, Driver: "sqlite", DSN: "file::memory:", DefaultFormat: "xml"},
+		"bad formats":      {Root: dir, Driver: "sqlite", DSN: "file::memory:", Formats: []string{"json", "xml"}},
+		"disabled default": {Root: dir, Driver: "sqlite", DSN: "file::memory:", Formats: []string{"csv"}, DefaultFormat: "json"},
+		"bad s3 url":       {Root: "s3:///prefix", Driver: "sqlite", DSN: "file::memory:"},
 	}
 	for name, h := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -403,5 +406,84 @@ func TestProvisionExpandsPlaceholders(t *testing.T) {
 	defer h.Cleanup()
 	if err := h.db.Ping(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHandlerHTML(t *testing.T) {
+	h := newSQLiteHandler(t, nil)
+
+	for name, req := range map[string]struct{ target, accept string }{
+		"extension": {"/markup.html", ""},
+		"accept":    {"/markup", "text/html,application/xhtml+xml,*/*;q=0.8"},
+	} {
+		res := serve(t, h, "POST", req.target, "", map[string]string{"Accept": req.accept})
+		if res.status != 200 || res.header.Get("Content-Type") != "text/html; charset=utf-8" {
+			t.Fatalf("%s: status %d type %q", name, res.status, res.header.Get("Content-Type"))
+		}
+		if csp := res.header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+			t.Errorf("%s: CSP %q", name, csp)
+		}
+		for _, want := range []string{
+			"<details>", "<summary>", "</details>",
+			"<th>&lt;b&gt;col&lt;/b&gt;</th>",
+			"<td>&lt;script&gt;alert(1)&lt;/script&gt;</td>",
+			`<td class="null"></td>`,
+			"SELECT &#39;&lt;script&gt;alert(1)&lt;/script&gt;&#39; AS",
+		} {
+			if !strings.Contains(res.body, want) {
+				t.Errorf("%s: body lacks %q:\n%s", name, want, res.body)
+			}
+		}
+		// The query sits in a closed accordion, before the table.
+		if strings.Contains(res.body, "<details open") || strings.Index(res.body, "<details>") > strings.Index(res.body, "<table>") {
+			t.Errorf("%s: query should be a collapsed accordion above the table", name)
+		}
+		// Nothing but the (escaped) data may mention a script.
+		if strings.Contains(strings.ToLower(res.body), "<script") {
+			t.Errorf("%s: page must not contain scripts:\n%s", name, res.body)
+		}
+	}
+
+	res := serve(t, h, "POST", "/users.html", `{"min_score":0}`, nil)
+	if res.status != 200 || !strings.Contains(res.body, "Grace, &#34;Amazing&#34;") || !strings.Contains(res.body, "<td>AP8=</td>") {
+		t.Errorf("users: status %d body %s", res.status, res.body)
+	}
+
+	res = serve(t, h, "POST", "/empty.html", "", nil)
+	if res.status != 200 || !strings.Contains(res.body, "<th>id</th><th>name</th>") || strings.Contains(res.body, "<td") {
+		t.Errorf("empty: status %d body %s", res.status, res.body)
+	}
+
+	// JSON stays the default when nothing picks a format.
+	res = serve(t, h, "POST", "/empty", "", nil)
+	if res.body != "[]\n" {
+		t.Errorf("default body %q", res.body)
+	}
+}
+
+func TestHandlerRestrictedFormats(t *testing.T) {
+	h := newSQLiteHandler(t, func(h *SQLExecutor) { h.Formats = []string{"csv", "yaml"} })
+
+	if res := serve(t, h, "POST", "/empty", "", nil); res.status != 200 || res.body != "id,name\n" {
+		t.Errorf("default should fall back to the first format: status %d body %q", res.status, res.body)
+	}
+	if res := serve(t, h, "POST", "/empty.yaml", "", nil); res.status != 200 {
+		t.Errorf("yaml: status %d", res.status)
+	}
+	for _, target := range []string{"/empty.json", "/empty.html", "/empty.xlsx"} {
+		res := serve(t, h, "POST", target, "", nil)
+		if res.status != 406 || !strings.Contains(res.body, "text/csv, application/yaml") || res.nextCalls != 0 {
+			t.Errorf("%s: status %d body %s", target, res.status, res.body)
+		}
+	}
+	for _, accept := range []string{"application/json", "text/html"} {
+		res := serve(t, h, "POST", "/empty", "", map[string]string{"Accept": accept})
+		if res.status != 406 {
+			t.Errorf("Accept %s: status %d", accept, res.status)
+		}
+	}
+	// A disabled format does not hide queries that do not exist.
+	if res := serve(t, h, "POST", "/missing.json", "", nil); res.nextCalls != 1 {
+		t.Errorf("missing query should fall through, status %d", res.status)
 	}
 }

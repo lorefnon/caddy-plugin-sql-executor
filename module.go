@@ -1,7 +1,7 @@
 // Package sqlexecutor is a Caddy HTTP handler that exposes every .sql file
-// in a directory or S3 bucket as a POST endpoint. Each request runs the
-// file's query against a configured PostgreSQL or SQLite database and
-// returns the result as JSON, CSV, YAML or XLSX.
+// in a directory or S3 bucket as a POST endpoint, or as an endpoint per HTTP
+// method with verb_named_files. Each request runs the file's query against a configured PostgreSQL or SQLite database and
+// returns the result as JSON, CSV, YAML, XLSX or HTML.
 package sqlexecutor
 
 import (
@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -58,8 +59,11 @@ type SQLExecutor struct {
 	Timeout caddy.Duration `json:"timeout,omitempty"`
 	// Maximum request body size in bytes. Default: 1 MiB.
 	MaxBodySize int64 `json:"max_body_size,omitempty"`
+	// Formats clients may request: any of json, csv, yaml, xlsx and html.
+	// Default: all of them.
+	Formats []string `json:"formats,omitempty"`
 	// Format used when neither extension nor Accept header picks one:
-	// json (default), csv, yaml or xlsx.
+	// json (default), csv, yaml, xlsx or html. Must be one of Formats.
 	DefaultFormat string `json:"default_format,omitempty"`
 	// Connection pool limits; zero means database/sql defaults.
 	MaxOpenConns int `json:"max_open_conns,omitempty"`
@@ -71,12 +75,17 @@ type SQLExecutor struct {
 	// macro. Templates are loaded from the query root by names relative to
 	// it, ending in .j2.
 	JinjaIncludes bool `json:"jinja_includes,omitempty"`
+	// Route by HTTP method: DELETE /foo/bar runs foo/bar/DELETE.sql, and
+	// every method is allowed. Off by default, in which case only POST is
+	// handled and POST /foo/bar runs foo/bar.sql.
+	VerbNamedFiles bool `json:"verb_named_files,omitempty"`
 
 	db            *sql.DB
 	style         placeholderStyle
 	source        source
 	templates     *templateCache
 	defaultFormat format
+	formats       formatSet
 	logger        *zap.Logger
 }
 
@@ -96,11 +105,22 @@ func (h *SQLExecutor) Provision(ctx caddy.Context) error {
 	if h.MaxBodySize <= 0 {
 		h.MaxBodySize = defaultMaxBodySize
 	}
+	formats, first, err := parseFormats(h.Formats)
+	if err != nil {
+		return err
+	}
+	h.formats = formats
 	h.defaultFormat = formatJSON
+	if !formats.has(formatJSON) {
+		h.defaultFormat = first
+	}
 	if h.DefaultFormat != "" {
 		f, ok := parseFormat(h.DefaultFormat)
 		if !ok {
 			return fmt.Errorf("unknown default_format %q", h.DefaultFormat)
+		}
+		if !formats.has(f) {
+			return fmt.Errorf("default_format %q is not among the enabled formats", h.DefaultFormat)
 		}
 		h.defaultFormat = f
 	}
@@ -219,11 +239,17 @@ func (h *SQLExecutor) Cleanup() error {
 // ServeHTTP implements caddyhttp.MiddlewareHandler. Requests that do not
 // match a query file are passed to the next handler.
 func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	name, f, ok := resolveRoute(r.URL.Path)
+	route, f, ok := routeOf(r.URL.Path)
 	if !ok {
 		return next.ServeHTTP(w, r)
 	}
-	name, query, err := h.lookup(r.Context(), name)
+	verb := ""
+	if h.VerbNamedFiles {
+		if verb = r.Method; !validVerb(verb) {
+			return next.ServeHTTP(w, r)
+		}
+	}
+	name, query, pathParams, err := h.find(r.Context(), route, verb)
 	if errors.Is(err, fs.ErrNotExist) {
 		return next.ServeHTTP(w, r)
 	}
@@ -231,16 +257,19 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
-	if r.Method != http.MethodPost {
+	if !h.VerbNamedFiles && r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		return writeError(w, http.StatusMethodNotAllowed, "only POST is allowed")
 	}
 
+	supported := "supported types: " + strings.Join(h.formats.mediaTypes(), ", ")
+	if f != "" && !h.formats.has(f) {
+		return writeError(w, http.StatusNotAcceptable, "format not enabled; "+supported)
+	}
 	if f == "" {
-		negotiated, acceptable := negotiate(r.Header.Get("Accept"))
+		negotiated, acceptable := negotiate(r.Header.Get("Accept"), h.formats)
 		if !acceptable {
-			return writeError(w, http.StatusNotAcceptable,
-				"supported types: application/json, text/csv, application/yaml, "+xlsxMediaType)
+			return writeError(w, http.StatusNotAcceptable, supported)
 		}
 		f = negotiated
 	}
@@ -254,6 +283,10 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 	}
 	if err != nil {
 		return writeError(w, http.StatusBadRequest, err.Error())
+	}
+	// Values from the path can't be overridden by the client.
+	for k, v := range pathParams {
+		params[k] = v
 	}
 
 	stmt, args, err := h.prepare(r.Context(), name, query, params, r.Header)
@@ -279,6 +312,50 @@ func (h *SQLExecutor) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 // badRequestError marks failures caused by the request rather than the
 // query file.
 type badRequestError struct{ error }
+
+// validVerb reports whether method can name a query file, such as GET for
+// GET.sql.
+func validVerb(method string) bool {
+	if method == "" {
+		return false
+	}
+	for _, c := range method {
+		if (c < 'A' || c > 'Z') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// find returns the file backing a route, and the values captured from its
+// dynamic segments. Files named exactly like the route win over dynamic
+// ones. With verb set, the route is a directory holding verb.sql.
+// It returns an error wrapping fs.ErrNotExist if there is none.
+func (h *SQLExecutor) find(ctx context.Context, route, verb string) (name, query string, params map[string]any, err error) {
+	segs := strings.Split(route, "/")
+	// A request that spells out a dynamic name, such as /users/[id], is a
+	// request with "[id]" as the value, not one for the file of that name.
+	if !slices.ContainsFunc(segs, func(seg string) bool { kind, _ := parseSegment(seg); return kind != StaticSegment }) {
+		static := route + ".sql"
+		if verb != "" {
+			static = route + "/" + verb + ".sql"
+		}
+		name, query, err = h.lookup(ctx, static)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return name, query, nil, err
+		}
+	}
+
+	m, err := h.match(ctx, "", segs, verb)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if m == nil {
+		return "", "", nil, fs.ErrNotExist
+	}
+	name, query, err = h.lookup(ctx, m.File)
+	return name, query, m.Params, err
+}
 
 // lookup finds the file backing a route, trying name.sql, then the
 // template name.sql.j2. It returns the name of the file found.
@@ -345,6 +422,9 @@ func compileQuery(ctx context.Context, templates *templateCache, style placehold
 }
 
 func (h *SQLExecutor) execute(ctx context.Context, w http.ResponseWriter, name string, f format, query string, args []any) error {
+	// Argument values are left out since they carry request data.
+	h.logger.Debug("executing query",
+		zap.String("file", name), zap.String("sql", query), zap.Int("args", len(args)))
 	rows, err := h.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return h.queryFailed(w, name, err)
@@ -377,12 +457,18 @@ func (h *SQLExecutor) execute(ctx context.Context, w http.ResponseWriter, name s
 
 	hdr := w.Header()
 	hdr.Set("Content-Type", f.contentType())
+	if f == formatHTML {
+		// The page needs no scripts; forbid them as a second line of
+		// defence against anything the escaping might miss.
+		hdr.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+		hdr.Set("X-Content-Type-Options", "nosniff")
+	}
 	if f == formatXLSX {
 		hdr.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": sanitizeSheetName(name) + ".xlsx"}))
 	}
 	w.WriteHeader(http.StatusOK)
 
-	enc := newEncoder(f, w, name)
+	enc := newEncoder(f, w, name, query)
 	err = func() error {
 		if err := enc.Begin(cols); err != nil {
 			return err
