@@ -32,8 +32,11 @@ xcaddy build --with github.com/lorefnon/caddy-plugin-sql-executor
 Or from this repository, which includes a Caddy entrypoint with the standard modules:
 
 ```sh
-go build -o caddy ./cmd/caddy
+go build -o bin/caddy ./cmd/caddy
+go build -o bin/sql-openapi ./cmd/sql-openapi
 ```
+
+Built binaries go in `bin/`, which is gitignored.
 
 Requires Go 1.26 or newer. Both database drivers are pure Go ([pgx](https://github.com/jackc/pgx) and [modernc.org/sqlite](https://gitlab.com/cznic/sqlite)), so no cgo is needed.
 

@@ -1,3 +1,4 @@
+/bin/
 /caddy
 *.db
 *.db-shm
